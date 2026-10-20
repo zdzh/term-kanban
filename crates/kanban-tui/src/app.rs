@@ -116,6 +116,8 @@ pub struct App {
     pub archive_groups: Vec<Group>,
     pub archive_cards: Vec<Card>,
     pub archive_sel: usize,
+    /// 每个分组自己的纵向滚动偏移（保证选中的卡在视口里）。
+    pub scroll: Vec<u16>,
     pub hits: Vec<Hit>,
     /// 卡片正面要显示动作图标，所以要一张 card_id → 动作 的缓存。
     pub card_actions: HashMap<i64, Vec<Action>>,
@@ -145,6 +147,7 @@ impl App {
             archive_groups: Vec::new(),
             archive_cards: Vec::new(),
             archive_sel: 0,
+            scroll: Vec::new(),
             hits: Vec::new(),
             card_actions: HashMap::new(),
             card_subtasks: HashMap::new(),
@@ -179,6 +182,9 @@ impl App {
             if !subs.is_empty() {
                 self.card_subtasks.insert(card.id, subs);
             }
+        }
+        if self.scroll.len() < self.groups.len() {
+            self.scroll.resize(self.groups.len(), 0);
         }
         if self.sel_g >= self.groups.len() {
             self.sel_g = self.groups.len().saturating_sub(1);

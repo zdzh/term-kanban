@@ -95,8 +95,8 @@ fn render_board(app: &mut App, f: &mut Frame, area: Rect) {
 }
 
 fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: bool) {
-    let group = &app.groups[gi];
-    let cards = &app.cards[gi];
+    let group = app.groups[gi].clone();
+    let cards = app.cards[gi].clone();
     let open = cards.iter().filter(|c| !c.done).count();
     let done = cards.len() - open;
 
@@ -132,213 +132,276 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
         return;
     }
 
-    let card_actions: Vec<Vec<kanban_core::Action>> = cards
-        .iter()
-        .map(|c| app.card_actions.get(&c.id).cloned().unwrap_or_default())
-        .collect();
-
-    let mut y = inner.y;
-    let bottom = inner.y + inner.height;
+    // 先量好每张卡占几行，才能算出该滚到哪儿。
+    let mut rows: Vec<(usize, u16, u16)> = Vec::new(); // (card_idx, top, height)
+    let mut divider_top: Option<u16> = None;
+    let mut built: Vec<CardRender> = Vec::new();
+    let mut y: u16 = 0;
     let mut divider_drawn = false;
 
     for (ci, card) in cards.iter().enumerate() {
         if card.done && app.fold_done {
+            built.push(CardRender::default());
             continue;
         }
         if card.done && !divider_drawn {
-            if y >= bottom {
-                break;
+            divider_top = Some(y);
+            y += 1;
+            divider_drawn = true;
+        }
+        let is_sel = selected && ci == app.sel_c;
+        let r = build_card(app, card, inner.width, is_sel);
+        rows.push((ci, y, r.lines.len() as u16));
+        y += r.lines.len() as u16;
+        built.push(r);
+    }
+    let total = y;
+
+    // 纵向滚动：保证选中的卡一定在视口里。
+    if app.scroll.len() <= gi {
+        app.scroll.resize(gi + 1, 0);
+    }
+    let view = inner.height;
+    let mut scroll = app.scroll[gi];
+    if total <= view {
+        scroll = 0;
+    } else {
+        scroll = scroll.min(total - view);
+        if let Some(&(_, top, h)) = rows.iter().find(|(ci, _, _)| *ci == app.sel_c) {
+            if top < scroll {
+                scroll = top;
             }
+            if top + h > scroll + view {
+                scroll = top + h - view;
+            }
+            scroll = scroll.min(total - view);
+        }
+    }
+    app.scroll[gi] = scroll;
+
+    // 分隔线
+    if let Some(dt) = divider_top {
+        if dt >= scroll && dt < scroll + view {
             let line = "─".repeat(inner.width as usize);
             f.render_widget(
                 Paragraph::new(line).style(Style::new().fg(DIM)),
-                Rect::new(inner.x, y, inner.width, 1),
+                Rect::new(inner.x, inner.y + (dt - scroll), inner.width, 1),
             );
-            y += 1;
-            divider_drawn = true;
-            if y >= bottom {
-                break;
+        }
+    }
+
+    // 逐行画：超出视口的行直接跳过，天然完成裁剪。
+    for (ci, top, _) in &rows {
+        let r = &built[*ci];
+        let start_line = scroll.saturating_sub(*top);
+        for (li, line) in r.lines.iter().enumerate().skip(start_line as usize) {
+            let screen_y = inner.y as i32 + *top as i32 + li as i32 - scroll as i32;
+            if screen_y < inner.y as i32 || screen_y >= (inner.y + view) as i32 {
+                continue;
+            }
+            f.render_widget(
+                Paragraph::new(vec![line.clone()]),
+                Rect::new(inner.x, screen_y as u16, inner.width, 1),
+            );
+        }
+
+        let card_top = inner.y as i32 + *top as i32 - scroll as i32;
+        let height = r.lines.len() as u16;
+        // 卡片整体命中区（用于选择与拖拽），裁到视口内
+        let vtop = card_top.max(inner.y as i32);
+        let vbottom = (card_top + height as i32).min((inner.y + view) as i32);
+        if vbottom > vtop {
+            app.hits.push(Hit::Card {
+                rect: Rect::new(inner.x, vtop as u16, inner.width, (vbottom - vtop) as u16),
+                group: gi,
+                card: *ci,
+            });
+            app.hits.push(Hit::Check {
+                rect: Rect::new(inner.x + 1, card_top.max(inner.y as i32) as u16, 3, 1),
+                group: gi,
+                card: *ci,
+            });
+        }
+
+        for (x, li, action_id) in &r.act_hits {
+            let sy = inner.y as i32 + *top as i32 + *li as i32 - scroll as i32;
+            if sy >= inner.y as i32 && sy < (inner.y + view) as i32 {
+                app.hits.push(Hit::Act {
+                    rect: Rect::new(*x, sy as u16, 2, 1),
+                    action_id: *action_id,
+                });
             }
         }
-        if y + 2 > bottom {
-            break;
-        }
-
-        let is_sel = selected && ci == app.sel_c;
-        let is_picked = app.picked == Some(card.id);
-        // 选中用「左侧竖条 + 背景 + 青色加粗标题」三重标记，扫一眼就能定位。
-        let base_bg = if is_sel {
-            Some(SEL_BG)
-        } else if is_picked {
-            Some(PICK_BG)
-        } else {
-            None
-        };
-        let mut style = Style::new();
-        if let Some(bg) = base_bg {
-            style = style.bg(bg);
-        }
-        let marker = if is_sel {
-            Span::styled("▎", Style::new().fg(Color::Cyan).patch(style))
-        } else if is_picked {
-            Span::styled("▎", Style::new().fg(Color::Yellow).patch(style))
-        } else {
-            Span::styled(" ", style)
-        };
-
-        // 第一行：竖条 + 勾选框 + 标题
-        let check = if card.done { "☑ " } else { "☐ " };
-        let check_style = if card.done {
-            Style::new().fg(Color::Green)
-        } else {
-            Style::new().fg(if is_sel { Color::White } else { Color::Gray })
-        };
-        let title_style = if card.done {
-            Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT)
-        } else if is_sel {
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(Color::White)
-        };
-        let avail = inner.width.saturating_sub(3) as usize;
-        let title_text = truncate(&card.title, avail);
-        let line1 = Line::from(vec![
-            marker,
-            Span::styled(check, check_style.patch(style)),
-            Span::styled(title_text, title_style.patch(style)),
-        ]);
-
-        // 第二行：进度 / 动作图标 / 完成时间
-        let mut meta: Vec<Span> = Vec::new();
-        let mut act_hits: Vec<(u16, i64)> = Vec::new();
-        let mut x = inner.x;
-        let meta_style = Style::new().fg(DIM).patch(style);
-
-        if card.done {
-            let when = card
-                .completed_at
-                .map(|t| t.format("%m-%d %H:%M").to_string())
-                .unwrap_or_else(|| "-".into());
-            meta.push(Span::styled(
-                format!("  ✓ {when}"),
-                Style::new().fg(Color::Green).patch(style),
-            ));
-        } else {
-            let acts = &card_actions[ci];
-            let subs = app.card_subtasks.get(&card.id).cloned().unwrap_or_default();
-            let mut head = String::from("  ");
-            if !subs.is_empty() {
-                let done = subs.iter().filter(|s| s.done).count();
-                head.push_str(&format!("{}/{}", done, subs.len()));
-                if done == subs.len() {
-                    head.push_str(" ✓");
-                }
-                head.push(' ');
+        for (x, li, subtask_id) in &r.sub_hits {
+            let sy = inner.y as i32 + *top as i32 + *li as i32 - scroll as i32;
+            if sy >= inner.y as i32 && sy < (inner.y + view) as i32 {
+                app.hits.push(Hit::SubCheck {
+                    rect: Rect::new(*x, sy as u16, 2, 1),
+                    subtask_id: *subtask_id,
+                });
             }
+        }
+    }
+
+    // 还有卡在视口外时，右下角给个提示
+    if total > view && scroll + view < total {
+        let more = total - (scroll + view);
+        let hint = format!("↓{more}");
+        let w = display_width(&hint).min(inner.width);
+        f.render_widget(
+            Paragraph::new(hint).style(Style::new().fg(DIM)),
+            Rect::new(inner.x + inner.width - w, inner.y + view - 1, w, 1),
+        );
+    }
+}
+
+/// 一张卡要画的行，以及这些行上可点击的区域（行号相对卡片顶部）。
+#[derive(Default)]
+struct CardRender {
+    lines: Vec<Line<'static>>,
+    act_hits: Vec<(u16, u16, i64)>,
+    sub_hits: Vec<(u16, u16, i64)>,
+}
+
+fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> CardRender {
+    let mut out = CardRender::default();
+    let is_picked = app.picked == Some(card.id);
+    let base_bg = if is_sel {
+        Some(SEL_BG)
+    } else if is_picked {
+        Some(PICK_BG)
+    } else {
+        None
+    };
+    let mut style = Style::new();
+    if let Some(bg) = base_bg {
+        style = style.bg(bg);
+    }
+    let marker = if is_sel {
+        Span::styled("▎", Style::new().fg(Color::Cyan).patch(style))
+    } else if is_picked {
+        Span::styled("▎", Style::new().fg(Color::Yellow).patch(style))
+    } else {
+        Span::styled(" ", style)
+    };
+
+    // 第一行：竖条 + 勾选框 + 标题
+    let check_style = if card.done {
+        Style::new().fg(Color::Green)
+    } else {
+        Style::new().fg(if is_sel { Color::White } else { Color::Gray })
+    };
+    let title_style = if card.done {
+        Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT)
+    } else if is_sel {
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::new().fg(Color::White)
+    };
+    out.lines.push(Line::from(vec![
+        marker,
+        Span::styled(
+            if card.done { "☑ " } else { "☐ " },
+            check_style.patch(style),
+        ),
+        Span::styled(
+            truncate(&card.title, width.saturating_sub(3) as usize),
+            title_style.patch(style),
+        ),
+    ]));
+
+    // 第二行：进度 / 动作图标 / 完成时间。什么都没有就不占行。
+    let mut meta: Vec<Span> = Vec::new();
+    let mut act_hits: Vec<(u16, u16, i64)> = Vec::new();
+    let meta_style = Style::new().fg(DIM).patch(style);
+    let subs = app.card_subtasks.get(&card.id).cloned().unwrap_or_default();
+    let acts = app.card_actions.get(&card.id).cloned().unwrap_or_default();
+
+    if card.done {
+        let when = card
+            .completed_at
+            .map(|t| t.format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-".into());
+        meta.push(Span::styled(
+            format!("  ✓ {when}"),
+            Style::new().fg(Color::Green).patch(style),
+        ));
+    } else {
+        let mut head = String::from("  ");
+        if !subs.is_empty() {
+            let done = subs.iter().filter(|s| s.done).count();
+            head.push_str(&format!("{}/{}", done, subs.len()));
+            if done == subs.len() {
+                head.push_str(" ✓");
+            }
+            head.push(' ');
+        }
+        let mut x = 0u16;
+        if !head.trim().is_empty() || !acts.is_empty() {
             meta.push(Span::styled(head.clone(), meta_style));
             x += display_width(&head);
-            for a in acts.iter().take(6) {
-                let color = match a.kind {
-                    ActionKind::Command => Color::Magenta,
-                    ActionKind::Link => Color::Blue,
-                };
-                meta.push(Span::styled(
-                    a.glyph(),
-                    Style::new()
-                        .fg(color)
-                        .add_modifier(Modifier::BOLD)
-                        .patch(style),
-                ));
-                meta.push(Span::styled(" ", meta_style));
-                act_hits.push((x, a.id));
-                x += 2;
-            }
         }
-
-        // 第三行起：有子任务就外显清单（点复选框即可勾）；没有子任务才显示两行正文预览。
-        let subs = if card.done {
-            Vec::new()
-        } else {
-            app.card_subtasks.get(&card.id).cloned().unwrap_or_default()
-        };
-        let mut extra: Vec<Line> = Vec::new();
-        let mut sub_hits: Vec<(u16, i64)> = Vec::new();
-        let text_w = inner.width.saturating_sub(4) as usize;
-
-        if !subs.is_empty() {
-            for s in &subs {
-                if (extra.len() as u16) + 2 > bottom.saturating_sub(y) {
-                    break;
-                }
-                let sub_style = if s.done {
-                    Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT)
-                } else {
-                    Style::new().fg(Color::Gray)
-                };
-                extra.push(Line::from(vec![
-                    Span::styled("  ", style),
-                    Span::styled(
-                        if s.done { "☑ " } else { "☐ " },
-                        Style::new()
-                            .fg(if s.done { Color::Green } else { Color::Gray })
-                            .patch(style),
-                    ),
-                    Span::styled(truncate(&s.text, text_w), sub_style.patch(style)),
-                ]));
-                sub_hits.push((inner.x + 2, s.id));
-            }
-        } else if !card.body.trim().is_empty() && !card.done {
-            let text = markdown::plain(&card.body);
-            for chunk in wrap_plain(&text, text_w).into_iter().take(2) {
-                extra.push(Line::from(Span::styled(
-                    format!("  {chunk}"),
-                    Style::new().fg(DIM).patch(style),
-                )));
-            }
+        for a in acts.iter().take(6) {
+            let color = match a.kind {
+                ActionKind::Command => Color::Magenta,
+                ActionKind::Link => Color::Blue,
+            };
+            meta.push(Span::styled(
+                a.glyph(),
+                Style::new()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD)
+                    .patch(style),
+            ));
+            meta.push(Span::styled(" ", meta_style));
+            act_hits.push((x, 1, a.id));
+            x += 2;
         }
-
-        // 放不下就不加额外行，避免最后一张卡把列撑破。
-        let max_extra = bottom.saturating_sub(y + 2);
-        if extra.len() as u16 > max_extra {
-            extra.truncate(max_extra as usize);
-        }
-        let height = 2 + extra.len() as u16;
-
-        let mut all = vec![line1, Line::from(meta)];
-        all.extend(extra);
-        f.render_widget(
-            Paragraph::new(all),
-            Rect::new(inner.x, y, inner.width, height),
-        );
-
-        app.hits.push(Hit::Card {
-            rect: Rect::new(inner.x, y, inner.width, height),
-            group: gi,
-            card: ci,
-        });
-        app.hits.push(Hit::Check {
-            rect: Rect::new(inner.x + 1, y, 3, 1),
-            group: gi,
-            card: ci,
-        });
-        // 动作图标与子任务复选框最后推，这样它们优先吃掉点击。
-        for (ax, action_id) in act_hits {
-            app.hits.push(Hit::Act {
-                rect: Rect::new(ax, y + 1, 2, 1),
-                action_id,
-            });
-        }
-        for (i, (sx, subtask_id)) in sub_hits.iter().enumerate() {
-            let _ = i;
-            app.hits.push(Hit::SubCheck {
-                rect: Rect::new(*sx, y + 2 + (i as u16), 2, 1),
-                subtask_id: *subtask_id,
-            });
-        }
-
-        // 任务之间不留空行：间距靠标题加粗和竖条区分。
-        y += height;
     }
+
+    if !meta.is_empty() {
+        out.act_hits = act_hits;
+        out.lines.push(Line::from(meta));
+    }
+
+    // 第三行起：有子任务就外显清单（点复选框即可勾）；没有才显示两行正文预览。
+    let text_w = width.saturating_sub(4) as usize;
+    let mut extras: Vec<Line> = Vec::new();
+    let mut sub_hits: Vec<(u16, u16, i64)> = Vec::new();
+
+    if !card.done && !subs.is_empty() {
+        for s in &subs {
+            let sub_style = if s.done {
+                Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                Style::new().fg(Color::Gray)
+            };
+            let li = out.lines.len() as u16 + extras.len() as u16;
+            extras.push(Line::from(vec![
+                Span::styled("  ", style),
+                Span::styled(
+                    if s.done { "☑ " } else { "☐ " },
+                    Style::new()
+                        .fg(if s.done { Color::Green } else { Color::Gray })
+                        .patch(style),
+                ),
+                Span::styled(truncate(&s.text, text_w), sub_style.patch(style)),
+            ]));
+            sub_hits.push((2, li, s.id));
+        }
+    } else if !card.done && !card.body.trim().is_empty() {
+        let text = markdown::plain(&card.body);
+        for chunk in wrap_plain(&text, text_w).into_iter().take(2) {
+            extras.push(Line::from(Span::styled(
+                format!("  {chunk}"),
+                Style::new().fg(DIM).patch(style),
+            )));
+        }
+    }
+
+    out.lines.extend(extras);
+    out.sub_hits = sub_hits;
+    out
 }
 
 fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
