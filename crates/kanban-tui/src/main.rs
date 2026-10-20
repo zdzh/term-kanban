@@ -1,7 +1,3 @@
-mod app;
-mod markdown;
-mod ui;
-
 use std::io::{self, BufRead, Write};
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -10,6 +6,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use kanban_core::{exec, ActionKind, Store};
+use kanban_tui::{app, ui};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 

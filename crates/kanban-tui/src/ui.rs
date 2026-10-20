@@ -22,10 +22,8 @@ pub fn render(app: &mut App, f: &mut Frame) {
 
     match app.mode {
         Mode::Board => render_board(app, f, chunks[1]),
-        Mode::Detail => {
-            render_board(app, f, chunks[1]);
-            render_detail(app, f, f.area());
-        }
+        // 详情占满棋盘区域；底部那行留给状态栏，别互相盖
+        Mode::Detail => render_detail(app, f, chunks[1]),
         Mode::Archive => render_archive(app, f, chunks[1]),
     }
 
@@ -113,24 +111,7 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
         Style::new().fg(DIM)
     };
 
-    let title = Line::from(vec![
-        Span::styled(
-            format!(" {} ", group.name),
-            Style::new()
-                .fg(if selected { Color::Cyan } else { Color::White })
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("{open}"), Style::new().fg(Color::White)),
-        Span::styled("/", Style::new().fg(DIM)),
-        Span::styled(format!("{done}"), Style::new().fg(Color::Green)),
-    ]);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(title);
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
+    let inner = Block::default().borders(Borders::ALL).inner(rect);
 
     app.hits.push(Hit::Column { rect, group: gi });
 
@@ -185,6 +166,33 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
     }
     app.scroll[gi] = scroll;
 
+    // 「下面还有几张」写进标题，而不是盖在卡片上
+    let hidden = total.saturating_sub(view + scroll);
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" {} ", group.name),
+            Style::new()
+                .fg(if selected { Color::Cyan } else { Color::White })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{open}"), Style::new().fg(Color::White)),
+        Span::styled("/", Style::new().fg(DIM)),
+        Span::styled(format!("{done}"), Style::new().fg(Color::Green)),
+        Span::styled(
+            if hidden > 0 {
+                format!(" ↓{hidden}")
+            } else {
+                String::new()
+            },
+            Style::new().fg(DIM),
+        ),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title);
+    f.render_widget(block, rect);
+
     // 分隔线
     if let Some(dt) = divider_top {
         if dt >= scroll && dt < scroll + view {
@@ -205,9 +213,13 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
             if screen_y < inner.y as i32 || screen_y >= (inner.y + view) as i32 {
                 continue;
             }
-            f.render_widget(
-                Paragraph::new(vec![line.clone()]).style(r.row_style),
-                Rect::new(inner.x, screen_y as u16, inner.width, 1),
+            paint_row(
+                f,
+                inner.x,
+                screen_y as u16,
+                inner.width,
+                r.row_style,
+                line.clone(),
             );
         }
 
@@ -248,17 +260,15 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
             }
         }
     }
+}
 
-    // 还有卡在视口外时，右下角给个提示
-    if total > view && scroll + view < total {
-        let more = total - (scroll + view);
-        let hint = format!("↓{more}");
-        let w = display_width(&hint).min(inner.width);
-        f.render_widget(
-            Paragraph::new(hint).style(Style::new().fg(DIM)),
-            Rect::new(inner.x + inner.width - w, inner.y + view - 1, w, 1),
-        );
-    }
+/// 画一整行（整行底色 + 文字）。
+///
+/// 底色必须打在 Paragraph 的 style 上而不是 Span 上，否则只有文字那一段被染色、
+/// 行尾空白不染，看起来就是一块形状不规则的补丁。
+fn paint_row(f: &mut Frame, x: u16, y: u16, width: u16, row_style: Style, line: Line<'static>) {
+    let rect = Rect::new(x, y, width, 1);
+    f.render_widget(Paragraph::new(vec![line]).style(row_style), rect);
 }
 
 /// 一张卡要画的行，以及这些行上可点击的区域（行号相对卡片顶部）。
@@ -351,7 +361,8 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
             meta.push(Span::styled(head.clone(), meta_style));
             x += display_width(&head);
         }
-        for a in acts.iter().take(6) {
+        let shown = acts.len().min(6);
+        for a in acts.iter().take(shown) {
             let color = match a.kind {
                 ActionKind::Command => Color::Magenta,
                 ActionKind::Link => Color::Blue,
@@ -366,6 +377,10 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
             meta.push(Span::styled(" ", meta_style));
             act_hits.push((x, 1, a.id));
             x += 2;
+        }
+        if acts.len() > shown {
+            // 超出的图标不画，但要让数量看得出来
+            meta.push(Span::styled(format!("+{}", acts.len() - shown), meta_style));
         }
     }
 
@@ -416,7 +431,9 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
 
 fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
     let Some(d) = &app.detail else { return };
-    let popup = centered(area, 84, 84);
+    let mut top = area;
+    top.height = top.height.min(area.height);
+    let popup = top;
     f.render_widget(Clear, popup);
 
     let card = d.card.clone();
@@ -428,10 +445,16 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
     let body_scroll = d.body_scroll;
     let last_run = d.last_run.clone();
 
+    let group_name = app
+        .groups
+        .iter()
+        .find(|g| g.id == card.group_id)
+        .map(|g| g.name.clone())
+        .unwrap_or_default();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Cyan))
-        .title(" 卡片详情  Esc 返回 Tab 切换焦点 ");
+        .title(format!(" 卡片详情 · {group_name} · Esc 返回 Tab 切换焦点 "));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -509,8 +532,14 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
             sub_inner,
         );
     }
-    for (i, s) in subtasks.iter().enumerate() {
-        let y = sub_inner.y + i as u16;
+    let sub_view = sub_inner.height as usize;
+    let sub_off = if sub_view > 0 && sel_sub + 1 > sub_view {
+        (sel_sub + 1 - sub_view).min(subtasks.len().saturating_sub(sub_view))
+    } else {
+        0
+    };
+    for (i, s) in subtasks.iter().enumerate().skip(sub_off) {
+        let y = sub_inner.y + (i - sub_off) as u16;
         if y >= sub_inner.y + sub_inner.height {
             break;
         }
@@ -520,6 +549,10 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
         } else {
             Style::new()
         };
+        let when = s
+            .completed_at
+            .map(|t| format!("  {}", t.format("%m-%d %H:%M")))
+            .unwrap_or_default();
         let line = Line::from(vec![
             Span::styled(
                 if s.done { "☑ " } else { "☐ " },
@@ -533,11 +566,12 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
                     Style::new().fg(Color::White)
                 },
             ),
+            Span::styled(
+                if s.done { when } else { String::new() },
+                Style::new().fg(DIM),
+            ),
         ]);
-        f.render_widget(
-            Paragraph::new(vec![line]).style(row_style),
-            Rect::new(sub_inner.x, y, sub_inner.width, 1),
-        );
+        paint_row(f, sub_inner.x, y, sub_inner.width, row_style, line);
     }
 
     // 动作
@@ -558,8 +592,14 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
             act_inner,
         );
     }
-    for (i, a) in actions.iter().enumerate() {
-        let y = act_inner.y + i as u16;
+    let act_view = act_inner.height as usize;
+    let act_off = if act_view > 0 && sel_act + 1 > act_view {
+        (sel_act + 1 - act_view).min(actions.len().saturating_sub(act_view))
+    } else {
+        0
+    };
+    for (i, a) in actions.iter().enumerate().skip(act_off) {
+        let y = act_inner.y + (i - act_off) as u16;
         if y >= act_inner.y + act_inner.height {
             break;
         }
@@ -586,19 +626,33 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
             ),
             Span::styled(terminal_mark, Style::new().fg(Color::Yellow)),
         ]);
-        f.render_widget(
-            Paragraph::new(vec![line]).style(row_style),
-            Rect::new(act_inner.x, y, act_inner.width, 1),
-        );
+        paint_row(f, act_inner.x, y, act_inner.width, row_style, line);
     }
 }
 
 fn render_archive(app: &mut App, f: &mut Frame, area: Rect) {
+    let total = app.archive_total();
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let view = inner.height as usize;
+    let offset = if view > 0 && total > view {
+        app.archive_sel.saturating_sub(view - 1).min(total - view)
+    } else {
+        0
+    };
+    app.archive_offset = offset;
+
+    let remaining = total.saturating_sub(offset + view);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Yellow))
-        .title(" 归档视图 · j/k 选择 u 恢复 x 彻底删除 v/Esc 返回 ");
-    let inner = block.inner(area);
+        .title(format!(
+            " 归档视图 · 共 {total} 项{} · j/k 选择 u 恢复 x 彻底删除 v/Esc 返回 ",
+            if remaining > 0 {
+                format!("（下面还有 {remaining}）")
+            } else {
+                String::new()
+            }
+        ));
     f.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -648,7 +702,8 @@ fn render_archive(app: &mut App, f: &mut Frame, area: Rect) {
             Style::new().fg(DIM),
         )));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    let shown: Vec<Line> = lines.into_iter().skip(offset).collect();
+    f.render_widget(Paragraph::new(shown), inner);
 }
 
 fn render_status(app: &App, f: &mut Frame, area: Rect) {
@@ -709,17 +764,6 @@ fn render_toast(app: &App, f: &mut Frame) {
         Paragraph::new(msg.clone()).style(Style::new().fg(Color::Yellow)),
         inner,
     );
-}
-
-fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
-    let w = area.width * pct_x / 100;
-    let h = area.height * pct_y / 100;
-    Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    )
 }
 
 /// 终端里的显示宽度：CJK 与全角符号占两格。

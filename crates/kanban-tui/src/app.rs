@@ -12,7 +12,7 @@ pub const MIN_COL_W: u16 = 24;
 const TOAST_TTL: Duration = Duration::from_secs(4);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Board,
     Detail,
@@ -118,6 +118,8 @@ pub struct App {
     pub archive_groups: Vec<Group>,
     pub archive_cards: Vec<Card>,
     pub archive_sel: usize,
+    /// 归档视图的滚动起点（渲染时按选中项算出来写回）。
+    pub archive_offset: usize,
     /// 当前的筛选词。为 None 时显示全部卡片。
     pub filter: Option<String>,
     /// 打开搜索框之前的筛选词，Esc 时用来还原。
@@ -153,6 +155,7 @@ impl App {
             archive_groups: Vec::new(),
             archive_cards: Vec::new(),
             archive_sel: 0,
+            archive_offset: 0,
             filter: None,
             filter_backup: None,
             scroll: Vec::new(),
@@ -392,11 +395,16 @@ impl App {
                     return;
                 }
                 if let Some(g) = self.groups.get(self.sel_g) {
-                    match self.store.create_card(g.id, &text) {
-                        Ok(_) => {
+                    let group_id = g.id;
+                    match self.store.create_card(group_id, &text) {
+                        Ok(id) => {
                             self.refresh();
-                            let len = self.cards.get(self.sel_g).map(|v| v.len()).unwrap_or(1);
-                            self.sel_c = len.saturating_sub(1);
+                            if self.cards.iter().flatten().any(|c| c.id == id) {
+                                let len = self.cards.get(self.sel_g).map(|v| v.len()).unwrap_or(1);
+                                self.sel_c = len.saturating_sub(1);
+                            } else {
+                                self.toast("已创建，但被当前筛选挡住了（Esc 清筛选）");
+                            }
                         }
                         Err(e) => self.toast(e.to_string()),
                     }
@@ -462,12 +470,9 @@ impl App {
                 } else {
                     ActionKind::Link
                 };
-                // 命令默认不在前端让出终端也能跑；ssh/vim 这类改 needs_terminal 走配置。
-                let needs_terminal = kind == ActionKind::Command
-                    && matches!(
-                        target.split_whitespace().next(),
-                        Some("ssh") | Some("vim") | Some("nvim") | Some("less") | Some("top")
-                    );
+                // 交互式命令（ssh / vim / htop…）自动标成需要终端，其余靠 `T` 手动调。
+                let needs_terminal =
+                    kind == ActionKind::Command && kanban_core::exec::infer_needs_terminal(&target);
                 if let Some(d) = &self.detail {
                     let card_id = d.card.id;
                     if let Err(e) =
@@ -740,19 +745,12 @@ impl App {
     }
 
     fn on_archive_key(&mut self, key: KeyEvent) -> Option<Effect> {
-        let total = self.archive_total();
         match key.code {
             KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('q') => {
                 self.mode = Mode::Board;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.archive_sel + 1 < total {
-                    self.archive_sel += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.archive_sel = self.archive_sel.saturating_sub(1)
-            }
+            KeyCode::Char('j') | KeyCode::Down => self.archive_move(1),
+            KeyCode::Char('k') | KeyCode::Up => self.archive_move(-1),
             KeyCode::Char('u') => self.restore_archived(),
             KeyCode::Char('x') => self.hard_delete_archived(),
             _ => {}
@@ -950,6 +948,12 @@ impl App {
             .cloned()
     }
 
+    fn archive_move(&mut self, delta: i32) {
+        let total = self.archive_total() as i32;
+        let next = (self.archive_sel as i32 + delta).clamp(0, (total - 1).max(0));
+        self.archive_sel = next as usize;
+    }
+
     fn restore_archived(&mut self) {
         if let Some(g) = self.archived_group_at(self.archive_sel) {
             let name = g.name.clone();
@@ -1045,11 +1049,19 @@ impl App {
                 None
             }
             MouseEventKind::ScrollDown => {
-                self.move_v(1);
+                if self.mode == Mode::Archive {
+                    self.archive_move(1);
+                } else {
+                    self.move_v(1);
+                }
                 None
             }
             MouseEventKind::ScrollUp => {
-                self.move_v(-1);
+                if self.mode == Mode::Archive {
+                    self.archive_move(-1);
+                } else {
+                    self.move_v(-1);
+                }
                 None
             }
             _ => None,
@@ -1423,6 +1435,62 @@ mod feature_tests {
         type_text(&mut a, "甲");
         assert_eq!(a.groups.len(), 1);
         assert_eq!(a.groups[0].name, "待办");
+    }
+
+    #[test]
+    fn new_card_hidden_by_filter_says_so() {
+        let mut a = app();
+        add_card(&mut a, "写周报");
+        a.on_key(key('/'));
+        type_text(&mut a, "周报");
+        a.on_key(code(KeyCode::Enter));
+        assert_eq!(total_cards(&a), 1);
+
+        // 新建一张不匹配筛选的卡：它不会出现，但要有提示
+        add_card(&mut a, "买菜");
+        assert_eq!(total_cards(&a), 1);
+        let msg = a.toast.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        assert!(msg.contains("筛选"), "toast = {msg:?}");
+    }
+
+    #[test]
+    fn archive_selection_cannot_run_off_the_list() {
+        let mut a = app();
+        add_card(&mut a, "甲");
+        let id = a.cards[0][0].id;
+        a.store.archive_card(id).unwrap();
+        a.refresh();
+
+        a.on_key(key('v'));
+        a.on_key(key('j'));
+        a.on_key(key('j'));
+        assert_eq!(a.archive_sel, 0, "只有一条时不能越界");
+        a.archive_move(-5);
+        assert_eq!(a.archive_sel, 0);
+        a.archive_move(5);
+        assert_eq!(a.archive_sel, 0);
+    }
+
+    #[test]
+    fn interactive_command_is_marked_needs_terminal() {
+        let mut a = app();
+        add_card(&mut a, "连服务器");
+        let id = a.cards[0][0].id;
+        a.on_key(code(KeyCode::Enter));
+
+        a.on_key(key('c'));
+        type_text(&mut a, "连跳板 | ssh jump-01");
+        a.on_key(code(KeyCode::Enter));
+        let acts = a.store.actions(id).unwrap();
+        assert_eq!(acts.len(), 1);
+        assert!(acts[0].needs_terminal, "ssh 应自动标成需要终端");
+
+        // 普通命令不该被标
+        a.on_key(key('c'));
+        type_text(&mut a, "跑测试 | cargo test");
+        a.on_key(code(KeyCode::Enter));
+        let acts = a.store.actions(id).unwrap();
+        assert!(!acts[1].needs_terminal);
     }
 
     #[test]

@@ -45,6 +45,105 @@ fn base_dir(name: &str) -> PathBuf {
     }
 }
 
+/// 一定要真终端的程序：没有 tty 它们要么报错，要么行为不对。
+const INTERACTIVE: &[&str] = &[
+    "ssh",
+    "mosh",
+    "vim",
+    "nvim",
+    "vi",
+    "nano",
+    "emacs",
+    "hx",
+    "less",
+    "more",
+    "most",
+    "top",
+    "htop",
+    "btop",
+    "tmux",
+    "screen",
+    "man",
+    "watch",
+    "psql",
+    "mysql",
+    "sqlite3",
+    "redis-cli",
+    "lazygit",
+    "gitui",
+    "tig",
+    "fzf",
+    "ssh-keygen",
+    "ncdu",
+];
+
+/// 解释器：只有在不带脚本参数（也就是要进 REPL）时才需要终端。
+const REPL: &[&str] = &[
+    "python", "python3", "node", "deno", "irb", "iex", "bash", "zsh", "sh", "fish",
+];
+
+/// 包在前面、本身不改变"目标程序是谁"的命令。
+const WRAPPERS: &[&str] = &[
+    "sudo", "doas", "env", "time", "exec", "command", "nice", "nohup", "stdbuf",
+];
+
+/// 包装命令里"带参数的开关"，跳过它们时要把后面的值一起跳过，
+/// 否则 `sudo -u root htop` 会把 `root` 当成程序名。
+fn flag_takes_value(wrapper: &str, flag: &str) -> bool {
+    match wrapper {
+        "sudo" => matches!(
+            flag,
+            "-u" | "-g" | "-p" | "-C" | "-U" | "-r" | "-t" | "-a" | "-D"
+        ),
+        "doas" => matches!(flag, "-u" | "-C"),
+        "nice" => matches!(flag, "-n"),
+        "env" => matches!(flag, "-u" | "-C" | "-P"),
+        "time" => matches!(flag, "-f" | "-o"),
+        "stdbuf" => matches!(flag, "-i" | "-o" | "-e"),
+        _ => false,
+    }
+}
+
+/// 猜一条命令要不要把终端让给它。
+///
+/// 只做保守判断：认得出来的交互程序返回 true，其余一律 false——猜错方向的代价不对称，
+/// 把普通命令当成需要终端只是多重绘一次，反过来 `ssh` 拿不到 tty 就直接不可用。
+pub fn infer_needs_terminal(cmd: &str) -> bool {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let mut i = 0;
+    let mut wrapper = "";
+
+    while i < tokens.len() {
+        let tok = tokens[i];
+
+        if tok.starts_with('-') {
+            i += if flag_takes_value(wrapper, tok) { 2 } else { 1 };
+            continue;
+        }
+        // `FOO=1 cmd` 这种前置环境变量
+        if tok.contains('=') {
+            i += 1;
+            continue;
+        }
+
+        let prog = tok.rsplit('/').next().unwrap_or(tok);
+        if WRAPPERS.contains(&prog) {
+            wrapper = prog;
+            i += 1;
+            continue;
+        }
+        if INTERACTIVE.contains(&prog) {
+            return true;
+        }
+        if REPL.contains(&prog) {
+            // `python` 后面还有参数就是跑脚本，不要终端
+            return tokens.len() == i + 1;
+        }
+        return false;
+    }
+    false
+}
+
 /// 数据与日志的落地目录。
 pub fn data_dir() -> PathBuf {
     base_dir(APP_DIR)
@@ -195,4 +294,47 @@ fn spawn_tee<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::infer_needs_terminal;
+
+    #[test]
+    fn interactive_programs_need_a_terminal() {
+        for cmd in [
+            "ssh myserver",
+            "vim notes.md",
+            "/usr/bin/htop",
+            "sudo -u root htop",
+            "FOO=1 less log.txt",
+            "tmux attach",
+            "psql -d app",
+        ] {
+            assert!(infer_needs_terminal(cmd), "{cmd} 应该判为需要终端");
+        }
+    }
+
+    #[test]
+    fn plain_commands_do_not() {
+        for cmd in [
+            "cargo test",
+            "git pull",
+            "npm run build",
+            "echo hi",
+            "python3 scripts/gen.py",
+            "node server.js",
+            "sudo systemctl restart nginx",
+            "",
+        ] {
+            assert!(!infer_needs_terminal(cmd), "{cmd} 不该被判为需要终端");
+        }
+    }
+
+    #[test]
+    fn bare_interpreters_are_repls() {
+        assert!(infer_needs_terminal("python3"));
+        assert!(infer_needs_terminal("node"));
+        assert!(!infer_needs_terminal("python3 app.py"));
+    }
 }

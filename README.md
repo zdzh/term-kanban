@@ -6,6 +6,10 @@
 
 <sub>分组横向平铺；选中的卡片带竖条与整行底色；子任务直接外显在卡片正面，点复选框就能勾。</sub>
 
+![卡片详情](docs/screenshot-detail.png)
+
+<sub>详情整屏：Markdown 正文、带完成时间的子任务、可执行的动作。</sub>
+
 ```
 crates/
   kanban-core/   域模型 · 存储 · 动作执行。不含任何 ratatui 类型
@@ -34,7 +38,8 @@ cargo run --release
 - **分组**是横向的列，只表示"属于哪个集合"，不表示进度。
 - 每个分组内部被分隔线切成**未完成段**（你手动排序）和**已完成段**（按完成时间倒序）。
 - 进度只有**勾选**这一个二值，勾上写完成时间，取消即清空并回到未完成段末尾。
-- **子任务**是卡片里的一行检查项，清单直接显示在卡片正面（点 `☐` 就能勾），全勾上也不会自动勾父卡。有子任务时正面不再显示正文预览。
+- **子任务**是卡片里的一行检查项，清单直接显示在卡片正面（点 `☐` 就能勾），全勾上也不会自动勾父卡。勾掉后它的完成时间显示在详情里。有子任务时正面不再显示正文预览。
+- **动作**是挂在卡片上的命令或链接。正面最多画 6 个图标（`$` 命令 / `↗` 链接），多出来的收成 `+N`；被标成「需要终端」的命令在详情里带一个 `⌨`。
 - **归档**是个盖章动作，不传染：归档分组不动组内卡片，恢复即原样回来。
 - 卡片没有删除键，**硬删除只在归档视图**里存在。
 
@@ -124,10 +129,24 @@ cargo run --release
 2. 同时把完整输出写进日志文件、并记一条运行记录（启动时间、退出码）；
 3. 跑完按回车返回看板。
 
-`ssh`、`vim` 这类交互程序需要终端输入——新增动作时会按命令名自动判断，也可以按 `T` 手动切换。日志在 `~/Library/Application Support/term-kanban/logs/`。
+新增动作时会按命令自动判断要不要终端：`ssh` / `vim` / `less` / `htop` / `tmux` / `psql` 这类，以及不带参数的 `python` / `node`（进 REPL）会自动标上；`sudo -u root htop` 这种带包装命令的也认得出来。判断错了按 `T` 手动切换。
+
+日志在 `~/Library/Application Support/term-kanban/logs/`。
 
 ## 以后想加 Web 版
 
 `kanban-core` 不认识 ratatui，所有变更都是意图式调用（`move_card(card_id, group_id, index)`）。加 Web 版时新增 `crates/kanban-server`（axum）把 core 包成 HTTP/JSON，TUI 一行不用改。
 
 ⚠️ 一旦对外暴露动作执行，必须只绑 `127.0.0.1` 并要求 token——**一个能跑 shell 的 HTTP 接口就是 RCE**。
+
+## 截图怎么来的
+
+截图不是抓屏，而是用 ratatui 的 `TestBackend` 把界面渲染到内存缓冲，再读每个格子画成图——比解析 ANSI 转义序列可靠（全角字符宽度、光标定位不会算歪），也不会因为换个终端就变样。
+
+```shell
+cd crates/kanban-tui
+cargo run --example dump_screen -- /path/to/kanban.db 96 30 > /tmp/board.json
+python3 ../../docs/make-screenshot.py /tmp/board.json ../../docs/screenshot.png
+```
+
+第五个参数是要先按的键（`\r` 回车、`\t` Tab、`\e` Esc），例如 `'\r'` 就能截详情页。
