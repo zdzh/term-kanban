@@ -1,0 +1,8 @@
+[package]
+name = "kanban-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+chrono.workspace = true

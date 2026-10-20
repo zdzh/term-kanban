@@ -1,0 +1,13 @@
+[package]
+name = "kanban-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kanban"
+path = "src/main.rs"
+
+[dependencies]
+kanban-core = { path = "../kanban-core" }
+ratatui.workspace = true
+crossterm.workspace = true
