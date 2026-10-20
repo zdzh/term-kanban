@@ -42,7 +42,13 @@ fn render_top(app: &App, f: &mut Frame, area: Rect) {
     let total_done = app.cards.iter().flatten().filter(|c| c.done).count();
     let title = match app.mode {
         Mode::Archive => " 归档视图 ".to_string(),
-        _ => format!(" 看板 · 未完成 {total_open} · 已完成 {total_done} "),
+        _ => match &app.filter {
+            Some(f) => format!(
+                " 筛选「{f}」· {} 张 · 未完成 {total_open} ",
+                app.cards.iter().flatten().count()
+            ),
+            None => format!(" 看板 · 未完成 {total_open} · 已完成 {total_done} "),
+        },
     };
     let line = Line::from(vec![
         Span::styled(
@@ -540,7 +546,7 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
         .borders(Borders::TOP)
         .border_style(Style::new().fg(if act_focused { Color::Cyan } else { DIM }))
         .title(Span::styled(
-            " 动作 · c 加命令 y 加链接 space 执行 d 删除 1-9 直接执行 ",
+            " 动作 · c 加命令 y 加链接 J/K 排序 space 执行 d 删除 1-9 直接执行 ",
             Style::new().fg(if act_focused { Color::Cyan } else { DIM }),
         ));
     let act_inner = act_block.inner(rows[3]);
@@ -650,7 +656,7 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
         Mode::Board if app.picked.is_some() => {
             "已拿起卡片 · hjkl 挪动 · Enter/m 放下 · Esc 取消".to_string()
         }
-        Mode::Board => "hjkl 移动 n 新建 space 勾选 Enter 详情 e 正文 m 拿起 a 归档 v 归档视图 A 归档分组 N 新分组 q 退出".to_string(),
+        Mode::Board => "/ 搜索 hjkl 移动 n 新建 space 勾选 Enter 详情 e 正文 m 拿起 a 归档 v 归档视图 A 归档分组 N 新分组 q 退出".to_string(),
         Mode::Detail => "Tab 切焦点 · space 勾选/执行 · 1-9 跑动作 · t 子任务 · c/y 加动作 · e 正文 · Esc 返回".to_string(),
         Mode::Archive => "j/k 选择 · u 恢复 · x 彻底删除 · v 返回".to_string(),
     };

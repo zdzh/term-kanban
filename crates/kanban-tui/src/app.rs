@@ -19,7 +19,7 @@ pub enum Mode {
     Archive,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Subtask,
     Action,
@@ -38,6 +38,7 @@ pub struct DetailState {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
+    Search,
     NewCard,
     EditCardTitle,
     NewGroup,
@@ -55,6 +56,7 @@ pub struct Prompt {
 impl Prompt {
     pub fn hint(&self) -> &'static str {
         match self.kind {
+            PromptKind::Search => "搜索（标题 / 正文 / 子任务）  Esc 取消",
             PromptKind::NewCard => "新卡片标题",
             PromptKind::EditCardTitle => "改标题",
             PromptKind::NewGroup => "新分组名",
@@ -116,6 +118,10 @@ pub struct App {
     pub archive_groups: Vec<Group>,
     pub archive_cards: Vec<Card>,
     pub archive_sel: usize,
+    /// 当前的筛选词。为 None 时显示全部卡片。
+    pub filter: Option<String>,
+    /// 打开搜索框之前的筛选词，Esc 时用来还原。
+    filter_backup: Option<String>,
     /// 每个分组自己的纵向滚动偏移（保证选中的卡在视口里）。
     pub scroll: Vec<u16>,
     pub hits: Vec<Hit>,
@@ -147,6 +153,8 @@ impl App {
             archive_groups: Vec::new(),
             archive_cards: Vec::new(),
             archive_sel: 0,
+            filter: None,
+            filter_backup: None,
             scroll: Vec::new(),
             hits: Vec::new(),
             card_actions: HashMap::new(),
@@ -165,7 +173,7 @@ impl App {
         if let Ok(groups) = self.store.groups(false, false) {
             self.groups = groups;
         }
-        self.cards = self
+        let mut all: Vec<Vec<Card>> = self
             .groups
             .iter()
             .map(|g| self.store.cards_in_group(g.id, false).unwrap_or_default())
@@ -173,7 +181,7 @@ impl App {
 
         self.card_actions.clear();
         self.card_subtasks.clear();
-        for card in self.cards.iter().flatten() {
+        for card in all.iter().flatten() {
             let acts = self.store.actions(card.id).unwrap_or_default();
             if !acts.is_empty() {
                 self.card_actions.insert(card.id, acts);
@@ -182,6 +190,26 @@ impl App {
             if !subs.is_empty() {
                 self.card_subtasks.insert(card.id, subs);
             }
+        }
+
+        // 搜索：跨分组过滤，命中的分组才显示，避免留下一排空栏。
+        if let Some(needle) = &self.filter {
+            let needle = needle.to_lowercase();
+            for cards in all.iter_mut() {
+                cards.retain(|c| self.card_matches(c, &needle));
+            }
+            let mut groups = Vec::new();
+            let mut kept = Vec::new();
+            for (i, g) in self.groups.iter().enumerate() {
+                if !all[i].is_empty() {
+                    groups.push(g.clone());
+                    kept.push(all[i].clone());
+                }
+            }
+            self.groups = groups;
+            self.cards = kept;
+        } else {
+            self.cards = all;
         }
         if self.scroll.len() < self.groups.len() {
             self.scroll.resize(self.groups.len(), 0);
@@ -198,6 +226,16 @@ impl App {
         if let Some(d) = &self.detail {
             self.reload_detail(d.card.id);
         }
+    }
+
+    fn card_matches(&self, card: &Card, needle: &str) -> bool {
+        if card.title.to_lowercase().contains(needle) || card.body.to_lowercase().contains(needle) {
+            return true;
+        }
+        self.card_subtasks
+            .get(&card.id)
+            .map(|subs| subs.iter().any(|s| s.text.to_lowercase().contains(needle)))
+            .unwrap_or(false)
     }
 
     fn reload_detail(&mut self, card_id: i64) {
@@ -299,28 +337,56 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => {
+                let was_search = prompt.kind == PromptKind::Search;
                 self.prompt = None;
+                if was_search {
+                    self.filter = self.filter_backup.take();
+                    self.refresh();
+                }
             }
             KeyCode::Enter => {
                 let kind = prompt.kind;
                 let buf = prompt.buf.clone();
                 self.prompt = None;
+                if kind == PromptKind::Search {
+                    self.filter_backup = None;
+                }
                 self.commit_prompt(kind, buf);
             }
             KeyCode::Backspace => {
                 prompt.buf.pop();
+                let kind = prompt.kind;
+                let buf = prompt.buf.clone();
+                if kind == PromptKind::Search {
+                    self.apply_search(buf);
+                }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 prompt.buf.push(c);
+                let kind = prompt.kind;
+                let buf = prompt.buf.clone();
+                if kind == PromptKind::Search {
+                    self.apply_search(buf);
+                }
             }
             _ => {}
         }
         None
     }
 
+    fn apply_search(&mut self, buf: String) {
+        self.filter = if buf.trim().is_empty() {
+            None
+        } else {
+            Some(buf.trim().to_string())
+        };
+        self.refresh();
+    }
+
     fn commit_prompt(&mut self, kind: PromptKind, buf: String) {
         let text = buf.trim().to_string();
         match kind {
+            PromptKind::Search => {}
             PromptKind::NewCard => {
                 if text.is_empty() {
                     return;
@@ -428,7 +494,22 @@ impl App {
         match key.code {
             KeyCode::Char('q') if !ctrl => self.should_quit = true,
             KeyCode::Char('c') if ctrl => self.should_quit = true,
-            KeyCode::Esc => self.picked = None,
+            KeyCode::Esc => {
+                if self.filter.is_some() {
+                    self.filter = None;
+                    self.refresh();
+                } else {
+                    self.picked = None;
+                }
+            }
+
+            KeyCode::Char('/') => {
+                self.filter_backup = self.filter.clone();
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Search,
+                    buf: self.filter.clone().unwrap_or_default(),
+                });
+            }
 
             KeyCode::Char('h') | KeyCode::Left => self.move_h(-1),
             KeyCode::Char('l') | KeyCode::Right => self.move_h(1),
@@ -594,28 +675,8 @@ impl App {
                     None => {}
                 }
             }
-            KeyCode::Char('J') => {
-                if let Some(d) = &self.detail {
-                    if d.focus == Focus::Subtask {
-                        if let Some(s) = d.subtasks.get(d.sel_sub) {
-                            let id = s.id;
-                            let _ = self.store.shift_subtask(id, 1);
-                            self.refresh_detail_after();
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('K') => {
-                if let Some(d) = &self.detail {
-                    if d.focus == Focus::Subtask {
-                        if let Some(s) = d.subtasks.get(d.sel_sub) {
-                            let id = s.id;
-                            let _ = self.store.shift_subtask(id, -1);
-                            self.refresh_detail_after();
-                        }
-                    }
-                }
-            }
+            KeyCode::Char('J') => self.shift_in_focus(1),
+            KeyCode::Char('K') => self.shift_in_focus(-1),
             KeyCode::Char('d') => {
                 let focus = self.detail.as_ref().map(|d| d.focus);
                 match focus {
@@ -837,6 +898,24 @@ impl App {
                 self.mode = Mode::Detail;
             }
         }
+    }
+
+    /// 焦点在子任务上就排子任务，在动作上就排动作。
+    fn shift_in_focus(&mut self, delta: i64) {
+        let Some(d) = &self.detail else { return };
+        match d.focus {
+            Focus::Subtask => {
+                if let Some(s) = d.subtasks.get(d.sel_sub) {
+                    let _ = self.store.shift_subtask(s.id, delta);
+                }
+            }
+            Focus::Action => {
+                if let Some(a) = d.actions.get(d.sel_act) {
+                    let _ = self.store.shift_action(a.id, delta);
+                }
+            }
+        }
+        self.refresh_detail_after();
     }
 
     fn toggle_subtask(&mut self) {
@@ -1238,5 +1317,145 @@ mod tests {
         assert!(d.subtasks[0].completed_at.is_some());
         // 父卡不被自动勾上
         assert!(!a.detail.as_ref().unwrap().card.done);
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use kanban_core::Store;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn app() -> App {
+        App::new(Store::open_in_memory().unwrap())
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn code(c: KeyCode) -> KeyEvent {
+        KeyEvent::new(c, KeyModifiers::NONE)
+    }
+
+    fn type_text(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.on_key(key(c));
+        }
+    }
+
+    fn add_card(app: &mut App, title: &str) {
+        app.on_key(key('n'));
+        type_text(app, title);
+        app.on_key(code(KeyCode::Enter));
+    }
+
+    fn total_cards(app: &App) -> usize {
+        app.cards.iter().map(|v| v.len()).sum()
+    }
+
+    #[test]
+    fn search_filters_by_title_and_restores_on_esc() {
+        let mut a = app();
+        add_card(&mut a, "写周报");
+        add_card(&mut a, "买菜");
+        assert_eq!(total_cards(&a), 2);
+
+        a.on_key(key('/'));
+        type_text(&mut a, "周报");
+        assert_eq!(total_cards(&a), 1);
+        assert_eq!(a.cards[0][0].title, "写周报");
+
+        // Esc 取消搜索，卡片都回来
+        a.on_key(code(KeyCode::Esc));
+        assert!(a.filter.is_none());
+        assert_eq!(total_cards(&a), 2);
+    }
+
+    #[test]
+    fn search_keeps_filter_on_enter_and_board_esc_clears_it() {
+        let mut a = app();
+        add_card(&mut a, "写周报");
+        add_card(&mut a, "买菜");
+
+        a.on_key(key('/'));
+        type_text(&mut a, "菜");
+        a.on_key(code(KeyCode::Enter));
+        assert!(a.prompt.is_none());
+        assert_eq!(total_cards(&a), 1);
+
+        a.on_key(code(KeyCode::Esc));
+        assert!(a.filter.is_none());
+        assert_eq!(total_cards(&a), 2);
+    }
+
+    #[test]
+    fn search_matches_body_and_subtasks() {
+        let mut a = app();
+        add_card(&mut a, "卡片甲");
+        let id = a.cards[0][0].id;
+        a.store.set_body(id, "里面提到了 nightly 构建").unwrap();
+        a.store.add_subtask(id, "补 metrics 面板").unwrap();
+        add_card(&mut a, "卡片乙");
+        a.refresh();
+
+        a.on_key(key('/'));
+        type_text(&mut a, "nightly");
+        assert_eq!(total_cards(&a), 1);
+        assert_eq!(a.cards[0][0].title, "卡片甲");
+
+        a.on_key(code(KeyCode::Esc));
+        a.on_key(key('/'));
+        type_text(&mut a, "metrics");
+        assert_eq!(total_cards(&a), 1);
+        assert_eq!(a.cards[0][0].title, "卡片甲");
+    }
+
+    #[test]
+    fn search_hides_groups_without_matches() {
+        let mut a = app();
+        add_card(&mut a, "甲");
+        a.on_key(key('l')); // 去第二个分组
+        add_card(&mut a, "乙");
+        assert_eq!(a.groups.len(), 3);
+
+        a.on_key(key('/'));
+        type_text(&mut a, "甲");
+        assert_eq!(a.groups.len(), 1);
+        assert_eq!(a.groups[0].name, "待办");
+    }
+
+    #[test]
+    fn actions_can_be_reordered_in_detail() {
+        let mut a = app();
+        add_card(&mut a, "带动作");
+        let id = a.cards[0][0].id;
+        let first = a
+            .store
+            .add_action(id, ActionKind::Command, "第一条", "echo 1", false)
+            .unwrap();
+        a.store
+            .add_action(id, ActionKind::Command, "第二条", "echo 2", false)
+            .unwrap();
+        a.refresh();
+
+        // 进详情，切到动作焦点
+        a.on_key(code(KeyCode::Enter));
+        a.on_key(code(KeyCode::Tab));
+        let d = a.detail.as_ref().unwrap();
+        assert_eq!(d.focus, Focus::Action);
+        assert_eq!(d.actions[0].id, first);
+
+        // 已经把第一条挪到下面，光标还在第 0 行时按 K 是空操作
+        a.on_key(key('J'));
+        let d = a.detail.as_ref().unwrap();
+        assert_eq!(d.actions[1].id, first);
+
+        // 跟到它身上再往回收
+        a.on_key(key('j'));
+        a.on_key(key('K'));
+        let d = a.detail.as_ref().unwrap();
+        assert_eq!(d.actions[0].id, first);
+        assert_eq!(d.actions[1].id, first + 1);
     }
 }

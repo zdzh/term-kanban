@@ -574,6 +574,36 @@ impl Store {
         Ok(())
     }
 
+    /// 动作上移（-1）或下移（+1）。
+    pub fn shift_action(&self, id: i64, delta: i64) -> Result<()> {
+        let card_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT card_id FROM actions WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound("动作"))?;
+        let all = self.actions(card_id)?;
+        let Some(idx) = all.iter().position(|a| a.id == id) else {
+            return Ok(());
+        };
+        let target = idx as i64 + delta;
+        if target < 0 || target >= all.len() as i64 {
+            return Ok(());
+        }
+        let mut order: Vec<i64> = all.iter().map(|a| a.id).collect();
+        order.swap(idx, target as usize);
+        for (i, aid) in order.iter().enumerate() {
+            self.conn.execute(
+                "UPDATE actions SET position=?2 WHERE id=?1",
+                params![aid, i as i64],
+            )?;
+        }
+        Ok(())
+    }
+
     /// 标记一个命令是否需要终端（ssh/vim 这类交互程序要，构建类不要）。
     pub fn set_action_needs_terminal(&self, id: i64, needs: bool) -> Result<()> {
         self.conn.execute(
