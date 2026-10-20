@@ -200,7 +200,7 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
                 continue;
             }
             f.render_widget(
-                Paragraph::new(vec![line.clone()]),
+                Paragraph::new(vec![line.clone()]).style(r.row_style),
                 Rect::new(inner.x, screen_y as u16, inner.width, 1),
             );
         }
@@ -259,6 +259,9 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
 #[derive(Default)]
 struct CardRender {
     lines: Vec<Line<'static>>,
+    /// 整行的底色（选中/拿起）。打在 Paragraph 上而不是 Span 上，
+    /// 否则只有文字那一段被染色，行尾空白不染，看着就是一块不规则的补丁。
+    row_style: Style,
     act_hits: Vec<(u16, u16, i64)>,
     sub_hits: Vec<(u16, u16, i64)>,
 }
@@ -277,6 +280,7 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
     if let Some(bg) = base_bg {
         style = style.bg(bg);
     }
+    out.row_style = style;
     let marker = if is_sel {
         Span::styled("▎", Style::new().fg(Color::Cyan).patch(style))
     } else if is_picked {
@@ -493,38 +497,42 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
         ));
     let sub_inner = sub_block.inner(rows[2]);
     f.render_widget(sub_block, rows[2]);
-    let mut lines = Vec::new();
+    if subtasks.is_empty() {
+        f.render_widget(
+            Paragraph::new("（没有子任务，按 t 加一条）").style(Style::new().fg(DIM)),
+            sub_inner,
+        );
+    }
     for (i, s) in subtasks.iter().enumerate() {
-        let sel = sub_focused && i == sel_sub;
-        let style = if sel {
+        let y = sub_inner.y + i as u16;
+        if y >= sub_inner.y + sub_inner.height {
+            break;
+        }
+        // 整行底色，避免高亮只盖住文字那一段
+        let row_style = if sub_focused && i == sel_sub {
             Style::new().bg(SEL_BG)
         } else {
             Style::new()
         };
-        lines.push(Line::from(vec![
+        let line = Line::from(vec![
             Span::styled(
                 if s.done { "☑ " } else { "☐ " },
-                Style::new()
-                    .fg(if s.done { Color::Green } else { Color::Gray })
-                    .patch(style),
+                Style::new().fg(if s.done { Color::Green } else { Color::Gray }),
             ),
             Span::styled(
                 s.text.clone(),
                 if s.done {
-                    Style::new().fg(DIM).patch(style)
+                    Style::new().fg(DIM).add_modifier(Modifier::CROSSED_OUT)
                 } else {
-                    style
+                    Style::new().fg(Color::White)
                 },
             ),
-        ]));
+        ]);
+        f.render_widget(
+            Paragraph::new(vec![line]).style(row_style),
+            Rect::new(sub_inner.x, y, sub_inner.width, 1),
+        );
     }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "（没有子任务，按 t 加一条）",
-            Style::new().fg(DIM),
-        )));
-    }
-    f.render_widget(Paragraph::new(lines), sub_inner);
 
     // 动作
     let act_focused = focus == Focus::Action;
@@ -537,10 +545,19 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
         ));
     let act_inner = act_block.inner(rows[3]);
     f.render_widget(act_block, rows[3]);
-    let mut lines = Vec::new();
+    if actions.is_empty() {
+        f.render_widget(
+            Paragraph::new("（没有动作，按 c 挂一条命令，或按 y 挂一个链接）")
+                .style(Style::new().fg(DIM)),
+            act_inner,
+        );
+    }
     for (i, a) in actions.iter().enumerate() {
-        let sel = act_focused && i == sel_act;
-        let style = if sel {
+        let y = act_inner.y + i as u16;
+        if y >= act_inner.y + act_inner.height {
+            break;
+        }
+        let row_style = if act_focused && i == sel_act {
             Style::new().bg(SEL_BG)
         } else {
             Style::new()
@@ -549,29 +566,25 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
             ActionKind::Command => Color::Magenta,
             ActionKind::Link => Color::Blue,
         };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", i + 1), Style::new().fg(DIM).patch(style)),
+        let terminal_mark = if a.needs_terminal { " ⌨" } else { "" };
+        let line = Line::from(vec![
+            Span::styled(format!("{} ", i + 1), Style::new().fg(DIM)),
             Span::styled(
                 format!("{} ", a.glyph()),
-                Style::new()
-                    .fg(color)
-                    .add_modifier(Modifier::BOLD)
-                    .patch(style),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(a.label.clone(), style),
+            Span::styled(a.label.clone(), Style::new().fg(Color::White)),
             Span::styled(
-                format!("  {}", truncate(&a.target, 40)),
-                Style::new().fg(DIM).patch(style),
+                format!("  {}", truncate(&a.target, 38)),
+                Style::new().fg(DIM),
             ),
-        ]));
+            Span::styled(terminal_mark, Style::new().fg(Color::Yellow)),
+        ]);
+        f.render_widget(
+            Paragraph::new(vec![line]).style(row_style),
+            Rect::new(act_inner.x, y, act_inner.width, 1),
+        );
     }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "（没有动作，按 c 挂一条命令，或按 y 挂一个链接）",
-            Style::new().fg(DIM),
-        )));
-    }
-    f.render_widget(Paragraph::new(lines), act_inner);
 }
 
 fn render_archive(app: &mut App, f: &mut Frame, area: Rect) {
