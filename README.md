@@ -1,4 +1,4 @@
-# task-kanban
+# term-kanban
 
 单用户自用的终端任务看板。Rust + ratatui，数据落在本地 SQLite。
 
@@ -18,8 +18,8 @@ cargo run --release
 
 数据默认落在：
 
-- macOS：`~/Library/Application Support/task-kanban/kanban.db`
-- 其它：`$XDG_DATA_HOME/task-kanban/kanban.db`
+- macOS：`~/Library/Application Support/term-kanban/kanban.db`
+- 其它：`$XDG_DATA_HOME/term-kanban/kanban.db`
 
 用 `KANBAN_DB=/path/to/kanban.db` 可以指到别处。
 
@@ -112,7 +112,7 @@ cargo run --release
 2. 同时把完整输出写进日志文件、并记一条运行记录（启动时间、退出码）；
 3. 跑完按回车返回看板。
 
-`ssh`、`vim` 这类交互程序需要终端输入——新增动作时会按命令名自动判断，也可以按 `T` 手动切换。日志在 `~/Library/Application Support/task-kanban/logs/`。
+`ssh`、`vim` 这类交互程序需要终端输入——新增动作时会按命令名自动判断，也可以按 `T` 手动切换。日志在 `~/Library/Application Support/term-kanban/logs/`。
 
 ## 以后想加 Web 版
 

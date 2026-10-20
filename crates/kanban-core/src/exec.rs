@@ -24,18 +24,47 @@ pub enum Outcome {
     },
 }
 
-/// 数据与日志的落地目录。
-pub fn data_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
+const APP_DIR: &str = "term-kanban";
+/// 项目还叫 task-kanban 时的数据目录，迁移用。
+const LEGACY_DIR: &str = "task-kanban";
+
+fn home() -> PathBuf {
+    std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn base_dir(name: &str) -> PathBuf {
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/task-kanban")
+        home().join("Library/Application Support").join(name)
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))
-            .join("task-kanban")
+            .unwrap_or_else(|| home().join(".local/share"))
+            .join(name)
+    }
+}
+
+/// 数据与日志的落地目录。
+pub fn data_dir() -> PathBuf {
+    base_dir(APP_DIR)
+}
+
+/// 从旧名字搬一次：只在旧目录存在、新目录不存在时动。
+pub fn migrate_legacy_dir() {
+    let old = base_dir(LEGACY_DIR);
+    let new = base_dir(APP_DIR);
+    if old.is_dir() && !new.exists() {
+        if let Some(parent) = new.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::rename(&old, &new) {
+            eprintln!(
+                "迁移数据目录失败（{} → {}）：{e}",
+                old.display(),
+                new.display()
+            );
+        }
     }
 }
 

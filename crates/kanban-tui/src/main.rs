@@ -16,6 +16,7 @@ use ratatui::Terminal;
 type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn main() -> io::Result<()> {
+    exec::migrate_legacy_dir();
     let dir = exec::data_dir();
     std::fs::create_dir_all(&dir)?;
     // KANBAN_DB 可以指到别处，方便测试或把数据放进同步目录。
