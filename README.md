@@ -2,6 +2,10 @@
 
 单用户自用的终端任务看板。Rust + ratatui，数据落在本地 SQLite。
 
+![看板截图](docs/screenshot.png)
+
+<sub>分组横向平铺；选中的卡片带竖条与整行底色；子任务直接外显在卡片正面，点复选框就能勾。</sub>
+
 ```
 crates/
   kanban-core/   域模型 · 存储 · 动作执行。不含任何 ratatui 类型
