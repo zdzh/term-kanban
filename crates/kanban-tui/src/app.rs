@@ -1854,12 +1854,18 @@ impl App {
 
     fn run_first_workspace_button_for(&mut self, card_id: i64) -> Option<Effect> {
         let card = self.store.card(card_id).ok()?;
-        let buttons = self.store.group_buttons(card.group_id).ok()?;
-        let button = buttons.iter().find(|b| b.kind == ButtonKind::Workspace)?;
-        Some(Effect::RunGroupButton {
-            card_id,
-            button_id: button.id,
-        })
+        let buttons = self.store.group_buttons(card.group_id).unwrap_or_default();
+        match buttons.iter().find(|b| b.kind == ButtonKind::Workspace) {
+            Some(b) => Some(Effect::RunGroupButton {
+                card_id,
+                button_id: b.id,
+            }),
+            None => {
+                // 静默什么都不做最难受：明确告诉用户去哪儿配
+                self.toast("这个分组还没有工作区按钮，按 g 加一个（类型选「工作区」）");
+                None
+            }
+        }
     }
 
     fn run_selected_group_button(&mut self) -> Option<Effect> {
