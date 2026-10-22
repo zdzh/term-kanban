@@ -140,7 +140,7 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection) -> Result<Self> {
         // WAL：让未来的 Web 版与 TUI 能同时读写同一份数据。
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -152,9 +152,12 @@ impl Store {
 
         conn.execute_batch(SCHEMA)?;
         if version < 2 {
-            Self::migrate_to_v2(&conn)?;
+            // 迁移要么全成要么全不成：中途被打断会留下半套 schema
+            let tx = conn.transaction()?;
+            Self::migrate_to_v2(&tx)?;
+            tx.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION}"))?;
+            tx.commit()?;
         }
-        conn.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION}"))?;
 
         let store = Store { conn };
         if store.groups(false, false)?.is_empty() {
@@ -184,7 +187,7 @@ impl Store {
         if has_old_shape {
             conn.execute_batch(
                 r#"
-                CREATE TABLE runs_v2 (
+                CREATE TABLE IF NOT EXISTS runs_v2 (
                     id         INTEGER PRIMARY KEY,
                     action_id  INTEGER REFERENCES actions(id) ON DELETE CASCADE,
                     source     TEXT    NOT NULL DEFAULT 'action',
@@ -194,6 +197,7 @@ impl Store {
                     exit_code  INTEGER,
                     log_path   TEXT    NOT NULL
                 );
+                DELETE FROM runs_v2;
                 INSERT INTO runs_v2 (id, action_id, source, started_at, ended_at, exit_code, log_path)
                     SELECT id, action_id, 'action', started_at, ended_at, exit_code, log_path FROM runs;
                 DROP TABLE runs;
