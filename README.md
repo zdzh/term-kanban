@@ -82,7 +82,7 @@ cargo run --release
 | worktree 根 | worktree 放在哪 | `{repo}/../{repo_name}.worktrees` |
 | 分支模板 | 每张卡的分支名 | `task/{card_id}-{slug}` |
 
-按钮与钩子都是**模板命令**，可用变量：`{card_id}` `{slug}` `{group}` `{repo}` `{repo_name}` `{worktree}` `{branch}`。
+按钮与钩子都是**模板命令**，可用变量：`{card_id}` `{slug}` `{group}` `{repo}` `{repo_name}` `{worktree}` `{branch}` `{title_arg}`。
 
 按钮在 `g` 面板里按 `a` 打开表单，四个字段各自独立填写：
 
@@ -108,6 +108,22 @@ tail -50 app.log | grep ERROR
 工作区   code {worktree}
 命令     git -C {repo} worktree remove {worktree}
 ```
+
+### 归到 cmux 的同一个分组
+
+默认 `cmux {worktree}` 会在侧边栏新加一条独立 workspace，一个仓库干十件事就是十条。想让同一仓库的任务收在一个可折叠分组里，用仓库自带的脚本：
+
+```
+/Users/pikaka/work/task-kanban/scripts/kanban-open-ws --repo {repo} --worktree {worktree} --branch {branch} --title {title_arg}
+```
+
+它会：建/复用 worktree → 按仓库名找到（或建出）cmux 分组 → 开 workspace 并放进组。
+同一个仓库的所有任务自然落在一个分组下面，重复点击只会选中已有 workspace，不会重复创建。
+
+细节与实测记录见 [docs/cmux-workspace-groups.md](docs/cmux-workspace-groups.md)。
+
+> 这里用 `{title_arg}` 而不是 `{title}`：前者会被转义成**一个参数**，
+> 标题里有空格、分号也不会被 shell 解释；后者仍然禁止出现在命令里。
 
 换工具只改这一行——代码里没有任何 `cmux` / `codex` / `code` 字样。`{title}` 只能用于显示，拼进命令会直接报错（要引用标题请用 `{slug}`）。
 

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# kanban-open-ws — 打开（必要时创建）一张看板卡片的工作区，并按仓库归到 cmux 分组。
+#
+# 由 term-kanban 的分组按钮调用，模板里传这些变量：
+#   kanban-open-ws --repo {repo} --worktree {worktree} --branch {branch} --title {title}
+#
+# 与 cmux-wt 的关系：cmux-wt 是"在仓库里主动新建一个 worktree"的交互工具；
+# 这里只做看板需要的那一小段——确保目录存在、把它开成 workspace、
+# 让同一个仓库的所有工作区落在同一个 cmux workspace group 下面。
+#
+# 分组规则：group 名字 = 仓库目录名，用 --idempotency-key "repo:<仓库绝对路径>"
+# 保证并发/重试不会建出两个同名组。
+
+set -euo pipefail
+
+REPO=""; WORKTREE=""; BRANCH=""; TITLE=""; CMD=""; NO_FOCUS=0
+
+die() { printf 'kanban-open-ws: %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) REPO="${2-}"; shift 2 ;;
+    --worktree) WORKTREE="${2-}"; shift 2 ;;
+    --branch) BRANCH="${2-}"; shift 2 ;;
+    --title) TITLE="${2-}"; shift 2 ;;
+    --command) CMD="${2-}"; shift 2 ;;
+    --no-focus) NO_FOCUS=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "未知参数 $1" ;;
+  esac
+done
+
+[ -n "$REPO" ] || die "缺少 --repo"
+[ -n "$WORKTREE" ] || die "缺少 --worktree"
+[ -n "$BRANCH" ] || BRANCH="work"
+
+command -v cmux >/dev/null 2>&1 || die "找不到 cmux"
+command -v git  >/dev/null 2>&1 || die "找不到 git"
+
+[ -d "$REPO" ] || die "仓库不存在：$REPO"
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "不是 git 仓库：$REPO"
+
+REPO_ROOT=$(git -C "$REPO" rev-parse --show-toplevel)
+REPO_NAME=$(basename "$REPO_ROOT")
+
+# 1) worktree 不存在就建（存在则复用，绝不重建）
+if [ ! -d "$WORKTREE" ]; then
+  mkdir -p "$(dirname "$WORKTREE")"
+  if git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null; then
+    git -C "$REPO_ROOT" worktree add "$WORKTREE" "$BRANCH"
+  else
+    git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WORKTREE"
+  fi
+fi
+
+# 2) 找到（或建出）这个仓库的 cmux 分组
+group_ref() {
+  local ref
+  ref=$(cmux workspace group list --json 2>/dev/null \
+    | jq -r --arg n "$REPO_NAME" '.groups[] | select(.name == $n) | .ref' | head -n 1)
+  if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+    cmux workspace group create --name "$REPO_NAME" \
+      --idempotency-key "repo:$REPO_ROOT" 2>/dev/null \
+      | sed -n 's/^OK \(workspace_group:[0-9A-Za-z-]*\).*/\1/p' | tail -n 1
+  else
+    printf '%s\n' "$ref"
+  fi
+}
+
+# cmux 建组时会自动生成一个锚点 workspace（落在当前目录，名字就是组名）。
+# 那个空白锚点在使用者眼里就是一条莫名其妙的条目，把它换成组里真实的成员。
+adopt_anchor() {
+  local group="$1" ws="$2"
+  [ -n "$group" ] && [ -n "$ws" ] || return 0
+  local generated old_anchor
+  generated=$(cmux workspace group list --json 2>/dev/null \
+    | jq -r --arg g "$group" '.groups[] | select(.ref == $g) | .anchor_workspace_is_generated')
+  [ "$generated" = "true" ] || return 0
+
+  old_anchor=$(cmux workspace group list --json 2>/dev/null \
+    | jq -r --arg g "$group" '.groups[] | select(.ref == $g) | .anchor_workspace_ref')
+
+  cmux workspace-group set-anchor --group "$group" --workspace "$ws" >/dev/null 2>&1 || return 0
+
+  # 换成真实成员后，那个自动生成的空锚点就没用了，关掉它
+  if [ -n "$old_anchor" ] && [ "$old_anchor" != "null" ] && [ "$old_anchor" != "$ws" ]; then
+    cmux workspace close "$old_anchor" >/dev/null 2>&1 || true
+  fi
+}
+
+# 3) 这个 worktree 是否已经开着某个 workspace
+existing_ws() {
+  cmux workspace list --json 2>/dev/null \
+    | jq -r --arg p "$WORKTREE" '.workspaces[] | select(.current_directory == $p) | .ref' \
+    | head -n 1
+}
+
+WS=$(existing_ws)
+
+if [ -n "$WS" ] && [ "$WS" != "null" ]; then
+  # 已经在跑：只把它归到正确的组里，然后选中
+  GROUP=$(group_ref)
+  if [ -n "$GROUP" ]; then
+    cmux workspace group add --group "$GROUP" --workspace "$WS" >/dev/null 2>&1 || true
+  fi
+  cmux workspace select "$WS" >/dev/null 2>&1 || true
+  printf '已打开现有工作区 %s（分组 %s）\n' "$WS" "${GROUP:-none}"
+  exit 0
+fi
+
+# 4) 新建 workspace 并放进分组
+GROUP=$(group_ref)
+TITLE_TEXT="${TITLE:-$REPO_NAME} · $(basename "$WORKTREE")"
+
+args=(--cwd "$WORKTREE" --name "$TITLE_TEXT")
+[ -n "$GROUP" ] && args+=(--group "$GROUP" --group-placement end)
+[ "$NO_FOCUS" -eq 1 ] && args+=(--focus false) || args+=(--focus true)
+[ -n "$CMD" ] && args+=(--command "$CMD")
+
+out=$(cmux workspace create "${args[@]}" 2>&1) || die "cmux workspace create 失败：$out"
+WS=$(printf '%s' "$out" | sed -n 's/^OK \(workspace:[0-9A-Za-z-]*\).*/\1/p' | tail -n 1)
+[ -n "$WS" ] || die "没拿到 workspace ref：$out"
+
+# 组刚建好时锚点是 cmux 自动生成的空 workspace，换成这张卡自己的
+adopt_anchor "$GROUP" "$WS"
+
+printf '已创建工作区 %s\n  cwd:   %s\n  分支:  %s\n  分组:  %s\n' \
+  "$WS" "$WORKTREE" "$BRANCH" "${GROUP:-none}"

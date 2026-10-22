@@ -26,7 +26,8 @@ impl fmt::Display for TemplateError {
             }
             TemplateError::TitleInCommand => write!(
                 f,
-                "命令里不能用 {{title}}（自由文本会变成注入面），请改用 {{slug}}"
+                "命令里不能用 {{title}}（自由文本会变成注入面）：要引用标题请用 {{slug}}，\
+                 需要把标题当参数传给脚本请用 {{title_arg}}"
             ),
             TemplateError::Unbalanced => write!(f, "模板里的花括号没有配对"),
         }
@@ -39,6 +40,7 @@ pub const VAR_NAMES: &[&str] = &[
     "card_id",
     "slug",
     "title",
+    "title_arg",
     "group",
     "repo",
     "repo_name",
@@ -162,6 +164,10 @@ fn substitute(
             if !allow_title && escape {
                 return Err(TemplateError::TitleInCommand);
             }
+            vars.title.clone()
+        } else if name == "title_arg" {
+            // 唯一允许把标题放进命令的方式：整体当成**一个参数**再转义，
+            // 空格、引号、分号都只会成为参数内容，不会被 shell 解释。
             vars.title.clone()
         } else {
             match vars.get(name) {
@@ -324,5 +330,44 @@ mod tests {
         assert_eq!(v.repo_name, "app");
         assert_eq!(v.branch, "task/12-nightly-ci");
         assert_eq!(v.worktree, "/w/app/../app.worktrees/12-nightly-ci");
+    }
+}
+
+#[cfg(test)]
+mod title_arg_tests {
+    use super::*;
+
+    fn vars() -> Vars {
+        Vars {
+            card_id: 7,
+            title: "修 bug; rm -rf /".into(),
+            slug: "bug-rm-rf".into(),
+            group: "本周".into(),
+            repo: "/w/app".into(),
+            repo_name: "app".into(),
+            worktree: "/w/app.worktrees/7-bug".into(),
+            branch: "task/7-bug".into(),
+        }
+    }
+
+    #[test]
+    fn title_arg_is_escaped_as_one_argument() {
+        let out = render_command("script --title {title_arg} --repo {repo}", &vars()).unwrap();
+        assert_eq!(out, "script --title '修 bug; rm -rf /' --repo /w/app");
+        // 分号被包在引号里，不会变成第二条命令
+        assert!(!out.contains("; rm -rf / "));
+    }
+
+    #[test]
+    fn bare_title_still_rejected_in_commands() {
+        assert!(matches!(
+            render_command("script --title {title}", &vars()),
+            Err(TemplateError::TitleInCommand)
+        ));
+        // 显示场景仍然可以
+        assert_eq!(
+            render_display("{title}", &vars()).unwrap(),
+            "修 bug; rm -rf /"
+        );
     }
 }
