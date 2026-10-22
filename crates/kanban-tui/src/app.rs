@@ -223,6 +223,12 @@ pub enum Hit {
         rect: Rect,
         subtask_id: i64,
     },
+    /// 卡片正面上的分组按钮图标
+    GroupBtn {
+        rect: Rect,
+        card_id: i64,
+        button_id: i64,
+    },
     Column {
         rect: Rect,
         group: usize,
@@ -1378,6 +1384,11 @@ impl App {
                         self.toggle_done();
                     }
                     Hit::Act { action_id, .. } => return Some(Effect::RunAction(action_id)),
+                    Hit::GroupBtn {
+                        card_id, button_id, ..
+                    } => {
+                        return Some(Effect::RunGroupButton { card_id, button_id });
+                    }
                     Hit::SubCheck { subtask_id, .. } => {
                         if let Err(e) = self.store.toggle_subtask(subtask_id) {
                             self.toast(e.to_string());
@@ -1452,6 +1463,7 @@ impl App {
                 | Hit::Check { rect, .. }
                 | Hit::Act { rect, .. }
                 | Hit::SubCheck { rect, .. }
+                | Hit::GroupBtn { rect, .. }
                 | Hit::Column { rect, .. } => *rect,
             };
             x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
@@ -1468,7 +1480,7 @@ impl App {
             Hit::Check { group, card, .. } => (group, Some(card)),
             Hit::Column { group, .. } => (group, None),
             // 落在图标或子任务复选框上等于取消拖拽。
-            Hit::Act { .. } | Hit::SubCheck { .. } => return,
+            Hit::Act { .. } | Hit::SubCheck { .. } | Hit::GroupBtn { .. } => return,
         };
         // 已完成段不接受拖拽——改完成状态只能用勾选。
         if let Some(i) = target_idx {

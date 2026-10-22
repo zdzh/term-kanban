@@ -1,4 +1,4 @@
-use kanban_core::{ActionKind, ButtonKind};
+use kanban_core::{ActionKind, ButtonKind, GroupButton};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
@@ -110,6 +110,7 @@ fn render_board(app: &mut App, f: &mut Frame, area: Rect) {
 fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: bool) {
     let group = app.groups[gi].clone();
     let cards = app.cards[gi].clone();
+    let group_buttons: Vec<GroupButton> = app.group_buttons.get(gi).cloned().unwrap_or_default();
     let open = cards.iter().filter(|c| !c.done).count();
     let done = cards.len() - open;
 
@@ -146,7 +147,7 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
             divider_drawn = true;
         }
         let is_sel = selected && ci == app.sel_c;
-        let r = build_card(app, card, inner.width, is_sel);
+        let r = build_card(app, card, &group_buttons, inner.width, is_sel);
         rows.push((ci, y, r.lines.len() as u16));
         y += r.lines.len() as u16;
         built.push(r);
@@ -259,6 +260,16 @@ fn render_group(app: &mut App, f: &mut Frame, rect: Rect, gi: usize, _first: boo
                 });
             }
         }
+        for (x, li, card_id, button_id) in &r.group_hits {
+            let sy = inner.y as i32 + *top as i32 + *li as i32 - scroll as i32;
+            if sy >= inner.y as i32 && sy < (inner.y + view) as i32 {
+                app.hits.push(Hit::GroupBtn {
+                    rect: Rect::new(*x, sy as u16, 2, 1),
+                    card_id: *card_id,
+                    button_id: *button_id,
+                });
+            }
+        }
         for (x, li, subtask_id) in &r.sub_hits {
             let sy = inner.y as i32 + *top as i32 + *li as i32 - scroll as i32;
             if sy >= inner.y as i32 && sy < (inner.y + view) as i32 {
@@ -289,9 +300,17 @@ struct CardRender {
     row_style: Style,
     act_hits: Vec<(u16, u16, i64)>,
     sub_hits: Vec<(u16, u16, i64)>,
+    /// (x, 行号, card_id, button_id)
+    group_hits: Vec<(u16, u16, i64, i64)>,
 }
 
-fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> CardRender {
+fn build_card(
+    app: &App,
+    card: &kanban_core::Card,
+    group_buttons: &[GroupButton],
+    width: u16,
+    is_sel: bool,
+) -> CardRender {
     let mut out = CardRender::default();
     let is_picked = app.picked == Some(card.id);
     let base_bg = if is_sel {
@@ -342,6 +361,7 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
     // 第二行：进度 / 动作图标 / 完成时间。什么都没有就不占行。
     let mut meta: Vec<Span> = Vec::new();
     let mut act_hits: Vec<(u16, u16, i64)> = Vec::new();
+    let mut out_group_hits: Vec<(u16, u16, i64, i64)> = Vec::new();
     let meta_style = Style::new().fg(DIM).patch(style);
     let subs = app.card_subtasks.get(&card.id).cloned().unwrap_or_default();
     let acts = app.card_actions.get(&card.id).cloned().unwrap_or_default();
@@ -393,6 +413,28 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
             // 超出的图标不画，但要让数量看得出来
             meta.push(Span::styled(format!("+{}", acts.len() - shown), meta_style));
         }
+
+        // 分组按钮：组内共享，青色，用 · 和卡片自己的动作分开
+        if !group_buttons.is_empty() && !card.done {
+            meta.push(Span::styled(" · ", meta_style));
+            x += 3;
+            for b in group_buttons.iter().take(4) {
+                let room = width.saturating_sub(x + 2) as usize;
+                if room < 2 {
+                    break;
+                }
+                meta.push(Span::styled(
+                    b.glyph(),
+                    Style::new()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                        .patch(style),
+                ));
+                meta.push(Span::styled(" ", meta_style));
+                out_group_hits.push((x, 1, card.id, b.id));
+                x += 2;
+            }
+        }
         // 工作区分支 + 脏标记
         if let Some((_path, branch, dirty)) = app.card_workspaces.get(&card.id) {
             meta.push(Span::styled(
@@ -414,6 +456,7 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
 
     if !meta.is_empty() {
         out.act_hits = act_hits;
+        out.group_hits = out_group_hits;
         out.lines.push(Line::from(meta));
     }
 

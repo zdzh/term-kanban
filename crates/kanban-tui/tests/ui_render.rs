@@ -533,3 +533,57 @@ fn hook_editor_has_its_own_fields() {
     assert_eq!(hooks[0].run, "echo done");
     assert!(hooks[0].confirm);
 }
+
+#[test]
+fn group_buttons_show_on_the_card_and_are_clickable() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    a.store
+        .set_group_config(gid, Some("/tmp/repo"), None, None)
+        .unwrap();
+    let btn = a
+        .store
+        .add_group_button(
+            gid,
+            "工作区",
+            ButtonKind::Workspace,
+            "cmux {worktree}",
+            "",
+            false,
+        )
+        .unwrap();
+    a.store.create_card(gid, "写周报").unwrap();
+    a.refresh();
+
+    // 画一帧，正面应出现分组按钮图标（青色 ⎇），并且带命中区
+    draw(&mut a);
+    let hit = a
+        .hits
+        .iter()
+        .find_map(|h| match h {
+            kanban_tui::app::Hit::GroupBtn {
+                rect,
+                card_id,
+                button_id,
+            } => Some((*rect, *card_id, *button_id)),
+            _ => None,
+        })
+        .expect("卡片正面应该有分组按钮的命中区");
+    assert_eq!(hit.2, btn);
+
+    // 点它 → 发起执行该按钮的意图
+    let effect = a.on_mouse(ratatui::crossterm::event::MouseEvent {
+        kind: ratatui::crossterm::event::MouseEventKind::Down(
+            ratatui::crossterm::event::MouseButton::Left,
+        ),
+        column: hit.0.x,
+        row: hit.0.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    match effect {
+        Some(kanban_tui::app::Effect::RunGroupButton { button_id, .. }) => {
+            assert_eq!(button_id, btn)
+        }
+        _ => panic!("点击分组按钮图标应该触发执行"),
+    }
+}
