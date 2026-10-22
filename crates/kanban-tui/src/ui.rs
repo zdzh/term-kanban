@@ -787,8 +787,38 @@ fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // 三段各自带一条分隔线与标题，和详情面板用同一套视觉语言
+    let btn_h = (snapshot.buttons.len().max(1) as u16).min(6) + 1;
+    let hook_h = (snapshot.hooks.len().max(1) as u16).min(4) + 1;
+    let rows = Layout::vertical([
+        Constraint::Length(4), // 分隔线 + 3 个字段
+        Constraint::Length(btn_h),
+        Constraint::Length(hook_h),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+
+    let section = |focused: bool, title: String| {
+        let color = if focused { Color::Cyan } else { DIM };
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::new().fg(color))
+            .title(Span::styled(title, Style::new().fg(color)))
+    };
+
+    // ---------- 仓库 ----------
+    let fields_focused = snapshot.focus == SettingsFocus::Fields;
+    let repo_title = if fields_focused {
+        " 仓库 · j/k 选择 Enter 编辑 ".to_string()
+    } else {
+        " 仓库 ".to_string()
+    };
+    let sec = section(fields_focused, repo_title);
+    let body = sec.inner(rows[0]);
+    f.render_widget(sec, rows[0]);
+
     let fields = [
-        ("仓库", &snapshot.repo, "（未关联 git 仓库）"),
+        ("路径", &snapshot.repo, "（未关联 git 仓库，按 Enter 填）"),
         (
             "worktree 根",
             &snapshot.worktree_root,
@@ -800,23 +830,12 @@ fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
             "（默认 task/{card_id}-{slug}）",
         ),
     ];
-
-    let btn_rows = snapshot.buttons.len() as u16;
-    let hook_rows = snapshot.hooks.len() as u16;
-    let rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(btn_rows.min(6) + 1),
-        Constraint::Length(1),
-        Constraint::Length(hook_rows.min(4) + 1),
-        Constraint::Min(1),
-    ])
-    .split(inner);
-
-    // 三个配置字段
     for (i, (label, value, hint)) in fields.iter().enumerate() {
-        let y = rows[0].y + i as u16;
-        let focused = snapshot.focus == SettingsFocus::Fields && snapshot.field == i;
+        let y = body.y + i as u16;
+        if y >= body.y + body.height {
+            break;
+        }
+        let focused = fields_focused && snapshot.field == i;
         let row_style = if focused {
             Style::new().bg(SEL_BG)
         } else {
@@ -828,88 +847,82 @@ fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
             Span::styled(value.to_string(), Style::new().fg(Color::White))
         };
         let line = Line::from(vec![
-            Span::styled(format!(" {}", pad(label, 12)), Style::new().fg(Color::Cyan)),
+            Span::styled(
+                format!(" {}  ", pad(label, 12)),
+                Style::new().fg(if focused { Color::Cyan } else { DIM }),
+            ),
             shown,
         ]);
-        paint_row(f, inner.x, y, inner.width, row_style, line);
+        paint_row(f, body.x, y, body.width, row_style, line);
     }
 
-    // 按钮
-    let btn_title = if snapshot.focus == SettingsFocus::Buttons {
-        " 按钮 · a 新增 Enter 试跑 d 删除 J/K 排序 T 终端 "
+    // ---------- 按钮 ----------
+    let btn_focused = snapshot.focus == SettingsFocus::Buttons;
+    let btn_title = if btn_focused {
+        " 按钮 · a 新增 Enter 试跑 d 删除 J/K 排序 T 终端 ".to_string()
     } else {
-        " 按钮 "
+        " 按钮 ".to_string()
     };
-    f.render_widget(
-        Paragraph::new(btn_title).style(Style::new().fg(
-            if snapshot.focus == SettingsFocus::Buttons {
-                Color::Cyan
-            } else {
-                DIM
-            },
-        )),
-        rows[1],
-    );
+    let sec = section(btn_focused, btn_title);
+    let body = sec.inner(rows[1]);
+    f.render_widget(sec, rows[1]);
+
     if snapshot.buttons.is_empty() {
         f.render_widget(
             Paragraph::new(" （还没有按钮，按 a 加一个，例如 工作区 | 工作区 | cmux {worktree}）")
                 .style(Style::new().fg(DIM)),
-            rows[2],
+            body,
         );
     }
-    for (i, b) in snapshot.buttons.iter().enumerate().take(6) {
-        let y = rows[2].y + i as u16;
-        let focused = snapshot.focus == SettingsFocus::Buttons && snapshot.sel == i;
+    for (i, b) in snapshot
+        .buttons
+        .iter()
+        .take(body.height as usize)
+        .enumerate()
+    {
+        let y = body.y + i as u16;
+        let focused = btn_focused && snapshot.sel == i;
         let row_style = if focused {
             Style::new().bg(SEL_BG)
         } else {
             Style::new()
         };
-        let target = if b.kind == ButtonKind::Workspace {
-            b.open_template.clone()
-        } else {
-            b.target.clone()
-        };
+        let target = b.command();
         let line = Line::from(vec![
             Span::styled(format!(" {} ", b.glyph()), Style::new().fg(Color::Magenta)),
-            Span::styled(format!("{:<10}", b.label), Style::new().fg(Color::White)),
-            Span::styled(truncate(&target, 40), Style::new().fg(DIM)),
+            Span::styled(pad(&b.label, 12), Style::new().fg(Color::White)),
+            Span::styled(truncate(target, 40), Style::new().fg(DIM)),
             Span::styled(
                 if b.needs_terminal { " ⌨" } else { "" },
                 Style::new().fg(Color::Yellow),
             ),
         ]);
-        paint_row(f, rows[2].x, y, rows[2].width, row_style, line);
+        paint_row(f, body.x, y, body.width, row_style, line);
     }
 
-    // 钩子
-    let hook_title = if snapshot.focus == SettingsFocus::Hooks {
-        " 完成钩子 · a 新增 d 删除 Enter/T 切换是否提示 "
+    // ---------- 完成钩子 ----------
+    let hook_focused = snapshot.focus == SettingsFocus::Hooks;
+    let hook_title = if hook_focused {
+        " 完成钩子 · a 新增 d 删除 Enter/T 切换是否提示 ".to_string()
     } else {
-        " 完成钩子 "
+        " 完成钩子 ".to_string()
     };
-    f.render_widget(
-        Paragraph::new(hook_title).style(Style::new().fg(
-            if snapshot.focus == SettingsFocus::Hooks {
-                Color::Cyan
-            } else {
-                DIM
-            },
-        )),
-        rows[3],
-    );
+    let sec = section(hook_focused, hook_title);
+    let body = sec.inner(rows[2]);
+    f.render_widget(sec, rows[2]);
+
     if snapshot.hooks.is_empty() {
         f.render_widget(
             Paragraph::new(
                 " （还没有钩子，按 a 加一条，例如 git -C {repo} worktree remove {worktree}）",
             )
             .style(Style::new().fg(DIM)),
-            rows[4],
+            body,
         );
     }
-    for (i, h) in snapshot.hooks.iter().enumerate().take(4) {
-        let y = rows[4].y + i as u16;
-        let focused = snapshot.focus == SettingsFocus::Hooks && snapshot.sel == i;
+    for (i, h) in snapshot.hooks.iter().take(body.height as usize).enumerate() {
+        let y = body.y + i as u16;
+        let focused = hook_focused && snapshot.sel == i;
         let row_style = if focused {
             Style::new().bg(SEL_BG)
         } else {
@@ -917,7 +930,7 @@ fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
         };
         let line = Line::from(vec![
             Span::styled(
-                format!(" {}", truncate(&h.run, 52)),
+                format!(" {} ", truncate(&h.run, 52)),
                 Style::new().fg(Color::White),
             ),
             Span::styled(
@@ -929,7 +942,7 @@ fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
                 Style::new().fg(if h.confirm { Color::Yellow } else { DIM }),
             ),
         ]);
-        paint_row(f, rows[4].x, y, rows[4].width, row_style, line);
+        paint_row(f, body.x, y, body.width, row_style, line);
     }
 }
 

@@ -343,3 +343,43 @@ fn detail_shows_relation_section() {
     assert!(has(&lines, "关联"), "{lines:#?}");
     assert!(has(&lines, "父 → 子卡"));
 }
+
+#[test]
+fn settings_panel_has_visible_section_separators() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    a.store
+        .set_group_config(gid, Some("/tmp/repo"), None, None)
+        .unwrap();
+    a.store
+        .add_group_button(
+            gid,
+            "工作区",
+            ButtonKind::Workspace,
+            "cmux {worktree}",
+            "",
+            false,
+        )
+        .unwrap();
+    a.store
+        .add_group_hook(gid, HOOK_ON_COMPLETE, "echo done", true)
+        .unwrap();
+    a.refresh();
+    press(&mut a, KeyCode::Char('g'));
+
+    let lines = text(&draw(&mut a));
+
+    // 三段标题都在
+    for title in ["仓库", "按钮", "完成钩子"] {
+        assert!(has(&lines, title), "缺少分区标题 {title}: {lines:#?}");
+    }
+
+    // 每个分区标题所在行都带一条分隔线
+    for title in ["仓库", "按钮", "完成钩子"] {
+        let line = lines
+            .iter()
+            .find(|l| l.contains(title) && l.contains('─'))
+            .unwrap_or_else(|| panic!("分区「{title}」没有分隔线: {lines:#?}"));
+        assert!(line.matches('─').count() > 20, "分隔线太短: {line:?}");
+    }
+}
