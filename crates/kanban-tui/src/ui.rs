@@ -1,4 +1,4 @@
-use kanban_core::ActionKind;
+use kanban_core::{ActionKind, ButtonKind};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
@@ -25,10 +25,15 @@ pub fn render(app: &mut App, f: &mut Frame) {
         // 详情占满棋盘区域；底部那行留给状态栏，别互相盖
         Mode::Detail => render_detail(app, f, chunks[1]),
         Mode::Archive => render_archive(app, f, chunks[1]),
+        Mode::GroupSettings => render_settings(app, f, chunks[1]),
+        Mode::Workspaces => render_workspaces(app, f, chunks[1]),
     }
 
     render_status(app, f, chunks[2]);
 
+    if app.confirm.is_some() {
+        render_confirm(app, f, f.area());
+    }
     if app.prompt.is_some() {
         render_prompt(app, f, f.area());
     }
@@ -357,7 +362,9 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
             head.push(' ');
         }
         let mut x = 0u16;
-        if !head.trim().is_empty() || !acts.is_empty() {
+        let has_badge = app.card_workspaces.contains_key(&card.id)
+            || app.relation_counts.contains_key(&card.id);
+        if !head.trim().is_empty() || !acts.is_empty() || has_badge {
             meta.push(Span::styled(head.clone(), meta_style));
             x += display_width(&head);
         }
@@ -381,6 +388,23 @@ fn build_card(app: &App, card: &kanban_core::Card, width: u16, is_sel: bool) -> 
         if acts.len() > shown {
             // 超出的图标不画，但要让数量看得出来
             meta.push(Span::styled(format!("+{}", acts.len() - shown), meta_style));
+        }
+        // 工作区分支 + 脏标记
+        if let Some((_path, branch, dirty)) = app.card_workspaces.get(&card.id) {
+            meta.push(Span::styled(
+                format!(" ⎇ {}", truncate(branch, 14)),
+                Style::new().fg(Color::Green).patch(style),
+            ));
+            if *dirty {
+                meta.push(Span::styled(
+                    "●",
+                    Style::new().fg(Color::Yellow).patch(style),
+                ));
+            }
+        }
+        // 关联数量
+        if let Some(n) = app.relation_counts.get(&card.id) {
+            meta.push(Span::styled(format!(" ⤷{n}"), meta_style));
         }
     }
 
@@ -458,13 +482,23 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let sub_h = (subtasks.len() as u16 + 2).min(inner.height / 3);
-    let act_h = (actions.len() as u16 + 2).min(inner.height / 3);
+    let rels = d.relations.clone();
+    let buttons = d.buttons.clone();
+    let sel_rel = d.sel_rel;
+    let sel_btn = d.sel_btn;
+    let workspace = d.workspace.clone();
+
+    let sub_h = (subtasks.len() as u16 + 2).min(inner.height / 5).max(3);
+    let act_h = (actions.len() as u16 + 2).min(inner.height / 5).max(3);
+    let rel_h = (rels.len() as u16 + 2).min(inner.height / 6).max(3);
+    let btn_h = (buttons.len() as u16 + 2).min(inner.height / 6).max(3);
     let rows = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(3),
         Constraint::Length(sub_h),
         Constraint::Length(act_h),
+        Constraint::Length(rel_h),
+        Constraint::Length(btn_h),
     ])
     .split(inner);
 
@@ -628,6 +662,390 @@ fn render_detail(app: &mut App, f: &mut Frame, area: Rect) {
         ]);
         paint_row(f, act_inner.x, y, act_inner.width, row_style, line);
     }
+
+    // 关联
+    let rel_focused = focus == Focus::Relation;
+    let rel_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(if rel_focused { Color::Cyan } else { DIM }))
+        .title(Span::styled(
+            " 关联 · r 新增 Enter 跳转 d 删除（父子） ",
+            Style::new().fg(if rel_focused { Color::Cyan } else { DIM }),
+        ));
+    let rel_inner = rel_block.inner(rows[4]);
+    f.render_widget(rel_block, rows[4]);
+    if rels.is_empty() {
+        f.render_widget(
+            Paragraph::new("（没有关联，按 r 关联另一张卡）").style(Style::new().fg(DIM)),
+            rel_inner,
+        );
+    }
+    let rel_view = rel_inner.height as usize;
+    let rel_off = if rel_view > 0 && sel_rel + 1 > rel_view {
+        (sel_rel + 1 - rel_view).min(rels.len().saturating_sub(rel_view))
+    } else {
+        0
+    };
+    for (i, (_, title, outgoing)) in rels.iter().enumerate().skip(rel_off) {
+        let y = rel_inner.y + (i - rel_off) as u16;
+        if y >= rel_inner.y + rel_inner.height {
+            break;
+        }
+        let row_style = if rel_focused && i == sel_rel {
+            Style::new().bg(SEL_BG)
+        } else {
+            Style::new()
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                if *outgoing { "父 → " } else { "子 ← " },
+                Style::new().fg(Color::Blue),
+            ),
+            Span::styled(title.clone(), Style::new().fg(Color::White)),
+        ]);
+        paint_row(f, rel_inner.x, y, rel_inner.width, row_style, line);
+    }
+
+    // 分组按钮
+    let btn_focused = focus == Focus::Button;
+    let btn_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(if btn_focused { Color::Cyan } else { DIM }))
+        .title(Span::styled(
+            format!(
+                " 分组按钮 · 组内共享（g 里配置）{} ",
+                if workspace.is_some() {
+                    "· 工作区已创建"
+                } else {
+                    ""
+                }
+            ),
+            Style::new().fg(if btn_focused { Color::Cyan } else { DIM }),
+        ));
+    let btn_inner = btn_block.inner(rows[5]);
+    f.render_widget(btn_block, rows[5]);
+    if buttons.is_empty() {
+        f.render_widget(
+            Paragraph::new("（这个分组还没有按钮，按 g 去配置）").style(Style::new().fg(DIM)),
+            btn_inner,
+        );
+    }
+    let btn_view = btn_inner.height as usize;
+    let btn_off = if btn_view > 0 && sel_btn + 1 > btn_view {
+        (sel_btn + 1 - btn_view).min(buttons.len().saturating_sub(btn_view))
+    } else {
+        0
+    };
+    for (i, b) in buttons.iter().enumerate().skip(btn_off) {
+        let y = btn_inner.y + (i - btn_off) as u16;
+        if y >= btn_inner.y + btn_inner.height {
+            break;
+        }
+        let row_style = if btn_focused && i == sel_btn {
+            Style::new().bg(SEL_BG)
+        } else {
+            Style::new()
+        };
+        let detail = if b.kind == ButtonKind::Workspace {
+            b.open_template.clone()
+        } else {
+            b.target.clone()
+        };
+        let line = Line::from(vec![
+            Span::styled(format!("{} ", b.glyph()), Style::new().fg(Color::Magenta)),
+            Span::styled(b.label.clone(), Style::new().fg(Color::White)),
+            Span::styled(format!("  {}", truncate(&detail, 46)), Style::new().fg(DIM)),
+        ]);
+        paint_row(f, btn_inner.x, y, btn_inner.width, row_style, line);
+    }
+}
+
+fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
+    use crate::app::{SettingsFocus, SettingsState};
+
+    let Some(st) = &app.settings else { return };
+    let snapshot: SettingsState = SettingsState {
+        group_id: st.group_id,
+        group_name: st.group_name.clone(),
+        repo: st.repo.clone(),
+        worktree_root: st.worktree_root.clone(),
+        branch: st.branch.clone(),
+        buttons: st.buttons.clone(),
+        hooks: st.hooks.clone(),
+        focus: st.focus,
+        field: st.field,
+        sel: st.sel,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(
+            " 分组设置 · {} · Tab 切分区 · Esc 返回 ",
+            snapshot.group_name
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let fields = [
+        ("仓库", &snapshot.repo, "（未关联 git 仓库）"),
+        (
+            "worktree 根",
+            &snapshot.worktree_root,
+            "（默认 {repo}/../{repo_name}.worktrees）",
+        ),
+        (
+            "分支模板",
+            &snapshot.branch,
+            "（默认 task/{card_id}-{slug}）",
+        ),
+    ];
+
+    let btn_rows = snapshot.buttons.len() as u16;
+    let hook_rows = snapshot.hooks.len() as u16;
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(btn_rows.min(6) + 1),
+        Constraint::Length(1),
+        Constraint::Length(hook_rows.min(4) + 1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+
+    // 三个配置字段
+    for (i, (label, value, hint)) in fields.iter().enumerate() {
+        let y = rows[0].y + i as u16;
+        let focused = snapshot.focus == SettingsFocus::Fields && snapshot.field == i;
+        let row_style = if focused {
+            Style::new().bg(SEL_BG)
+        } else {
+            Style::new()
+        };
+        let shown = if value.trim().is_empty() {
+            Span::styled(hint.to_string(), Style::new().fg(DIM))
+        } else {
+            Span::styled(value.to_string(), Style::new().fg(Color::White))
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" {}", pad(label, 12)), Style::new().fg(Color::Cyan)),
+            shown,
+        ]);
+        paint_row(f, inner.x, y, inner.width, row_style, line);
+    }
+
+    // 按钮
+    let btn_title = if snapshot.focus == SettingsFocus::Buttons {
+        " 按钮 · a 新增 Enter 试跑 d 删除 J/K 排序 T 终端 "
+    } else {
+        " 按钮 "
+    };
+    f.render_widget(
+        Paragraph::new(btn_title).style(Style::new().fg(
+            if snapshot.focus == SettingsFocus::Buttons {
+                Color::Cyan
+            } else {
+                DIM
+            },
+        )),
+        rows[1],
+    );
+    if snapshot.buttons.is_empty() {
+        f.render_widget(
+            Paragraph::new(" （还没有按钮，按 a 加一个，例如 工作区 | 工作区 | cmux {worktree}）")
+                .style(Style::new().fg(DIM)),
+            rows[2],
+        );
+    }
+    for (i, b) in snapshot.buttons.iter().enumerate().take(6) {
+        let y = rows[2].y + i as u16;
+        let focused = snapshot.focus == SettingsFocus::Buttons && snapshot.sel == i;
+        let row_style = if focused {
+            Style::new().bg(SEL_BG)
+        } else {
+            Style::new()
+        };
+        let target = if b.kind == ButtonKind::Workspace {
+            b.open_template.clone()
+        } else {
+            b.target.clone()
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" {} ", b.glyph()), Style::new().fg(Color::Magenta)),
+            Span::styled(format!("{:<10}", b.label), Style::new().fg(Color::White)),
+            Span::styled(truncate(&target, 40), Style::new().fg(DIM)),
+            Span::styled(
+                if b.needs_terminal { " ⌨" } else { "" },
+                Style::new().fg(Color::Yellow),
+            ),
+        ]);
+        paint_row(f, rows[2].x, y, rows[2].width, row_style, line);
+    }
+
+    // 钩子
+    let hook_title = if snapshot.focus == SettingsFocus::Hooks {
+        " 完成钩子 · a 新增 d 删除 Enter/T 切换是否提示 "
+    } else {
+        " 完成钩子 "
+    };
+    f.render_widget(
+        Paragraph::new(hook_title).style(Style::new().fg(
+            if snapshot.focus == SettingsFocus::Hooks {
+                Color::Cyan
+            } else {
+                DIM
+            },
+        )),
+        rows[3],
+    );
+    if snapshot.hooks.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                " （还没有钩子，按 a 加一条，例如 git -C {repo} worktree remove {worktree}）",
+            )
+            .style(Style::new().fg(DIM)),
+            rows[4],
+        );
+    }
+    for (i, h) in snapshot.hooks.iter().enumerate().take(4) {
+        let y = rows[4].y + i as u16;
+        let focused = snapshot.focus == SettingsFocus::Hooks && snapshot.sel == i;
+        let row_style = if focused {
+            Style::new().bg(SEL_BG)
+        } else {
+            Style::new()
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {}", truncate(&h.run, 52)),
+                Style::new().fg(Color::White),
+            ),
+            Span::styled(
+                if h.confirm {
+                    "  执行前提示"
+                } else {
+                    "  直接执行"
+                },
+                Style::new().fg(if h.confirm { Color::Yellow } else { DIM }),
+            ),
+        ]);
+        paint_row(f, rows[4].x, y, rows[4].width, row_style, line);
+    }
+}
+
+fn render_workspaces(app: &mut App, f: &mut Frame, area: Rect) {
+    let Some(ws) = &app.workspaces else { return };
+    let total = ws.items.len();
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let view = inner.height as usize;
+    let offset = if view > 0 && total > view {
+        ws.sel.saturating_sub(view - 1).min(total - view)
+    } else {
+        0
+    };
+    let remaining = total.saturating_sub(offset + view);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Green))
+        .title(format!(
+            " 工作区 · 共 {total} 个{} · Enter 打开 d 删除 Esc 返回 ",
+            if remaining > 0 {
+                format!("（下面还有 {remaining}）")
+            } else {
+                String::new()
+            }
+        ));
+    f.render_widget(block, area);
+
+    if total == 0 {
+        f.render_widget(
+            Paragraph::new("（还没有工作区：在配好仓库的分组里按 w）").style(Style::new().fg(DIM)),
+            inner,
+        );
+        return;
+    }
+
+    let items = ws.items.clone();
+    let sel = ws.sel;
+    for (i, (w, title, group, dirty)) in items.iter().enumerate().skip(offset) {
+        let y = inner.y + (i - offset) as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let row_style = if i == sel {
+            Style::new().bg(SEL_BG)
+        } else {
+            Style::new()
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                if *dirty { " ● " } else { "   " },
+                Style::new().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("{:<18}", truncate(title, 18)),
+                Style::new().fg(Color::White),
+            ),
+            Span::styled(
+                format!("{:<8}", truncate(group, 8)),
+                Style::new().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("{:<26}", truncate(&w.branch, 26)),
+                Style::new().fg(Color::Green),
+            ),
+            Span::styled(truncate(&w.path, 40), Style::new().fg(DIM)),
+        ]);
+        paint_row(f, inner.x, y, inner.width, row_style, line);
+    }
+}
+
+fn render_confirm(app: &App, f: &mut Frame, area: Rect) {
+    let Some(c) = &app.confirm else { return };
+    let w = area.width.saturating_sub(8).min(84);
+    let h = (c.commands.len() as u16 + 5).min(area.height);
+    let rect = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    );
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(Span::styled(
+            format!(" {} ", c.title),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled("将执行：", Style::new().fg(DIM))));
+    for cmd in &c.commands {
+        for chunk in wrap_plain(cmd, inner.width.saturating_sub(4) as usize) {
+            lines.push(Line::from(Span::styled(
+                format!("  {chunk}"),
+                Style::new().fg(Color::Green),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "y",
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 执行    ", Style::new().fg(DIM)),
+        Span::styled(
+            "n / Esc",
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 取消", Style::new().fg(DIM)),
+    ]));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_archive(app: &mut App, f: &mut Frame, area: Rect) {
@@ -711,9 +1129,14 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
         Mode::Board if app.picked.is_some() => {
             "已拿起卡片 · hjkl 挪动 · Enter/m 放下 · Esc 取消".to_string()
         }
-        Mode::Board => "/ 搜索 hjkl 移动 n 新建 space 勾选 Enter 详情 e 正文 m 拿起 a 归档 v 归档视图 A 归档分组 N 新分组 q 退出".to_string(),
+        Mode::Board => "g 分组设置 w 工作区 W 工作区总览 / 搜索 hjkl 移动 n 新建 space 勾选 Enter 详情 e 正文 m 拿起 a 归档 v 归档视图 A 归档分组 N 新分组 q 退出".to_string(),
         Mode::Detail => "Tab 切焦点 · space 勾选/执行 · 1-9 跑动作 · t 子任务 · c/y 加动作 · e 正文 · Esc 返回".to_string(),
         Mode::Archive => "j/k 选择 · u 恢复 · x 彻底删除 · v 返回".to_string(),
+        Mode::GroupSettings => {
+            "Tab 切分区 · j/k 选 · Enter 编辑/试跑 · a 新增 · d 删除 · J/K 排序 · T 切换 · Esc 返回"
+                .to_string()
+        }
+        Mode::Workspaces => "j/k 选择 · Enter 打开 · d 删除工作区 · W/Esc 返回".to_string(),
     };
     f.render_widget(
         Paragraph::new(hint)
@@ -802,6 +1225,16 @@ fn wrap_plain(text: &str, max: usize) -> Vec<String> {
     }
     if !cur.is_empty() {
         out.push(cur);
+    }
+    out
+}
+
+/// 按终端显示宽度右侧补空格（中文占两格，`{:<10}` 会错位）。
+fn pad(s: &str, width: usize) -> String {
+    let w = display_width(s) as usize;
+    let mut out = s.to_string();
+    if w < width {
+        out.push_str(&" ".repeat(width - w));
     }
     out
 }

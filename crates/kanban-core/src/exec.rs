@@ -179,48 +179,47 @@ pub fn log_dir() -> PathBuf {
 pub fn run(store: &Store, action: &Action, echo_to_stdout: bool) -> Result<Outcome> {
     match action.kind {
         ActionKind::Link => {
-            open_link(&action.target)?;
+            open_url(&action.target)?;
             Ok(Outcome::LinkOpened)
         }
-        ActionKind::Command => run_command(store, action, echo_to_stdout),
+        ActionKind::Command => run_shell(
+            store,
+            "action",
+            Some(action.id),
+            &action.target,
+            action.needs_terminal,
+            echo_to_stdout,
+        ),
     }
 }
 
-fn open_link(url: &str) -> Result<()> {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let status = Command::new(opener)
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| StoreError::Io(format!("打不开链接 {url}: {e}")))?;
-    if !status.success() {
-        return Err(StoreError::Io(format!("打开链接失败: {url}")));
-    }
-    Ok(())
-}
-
-fn run_command(store: &Store, action: &Action, echo_to_stdout: bool) -> Result<Outcome> {
+/// 直接跑一条命令字符串：分组按钮、钩子都走这里。
+///
+/// `source` 记进运行记录，用来区分是卡片动作、分组按钮还是钩子触发的。
+pub fn run_shell(
+    store: &Store,
+    source: &str,
+    action_id: Option<i64>,
+    command: &str,
+    needs_terminal: bool,
+    echo_to_stdout: bool,
+) -> Result<Outcome> {
     let dir = log_dir();
     std::fs::create_dir_all(&dir).map_err(|e| StoreError::Io(format!("建日志目录失败: {e}")))?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let log_path = dir.join(format!("action-{}-{}.log", action.id, stamp));
+    let log_path = dir.join(format!("{source}-{stamp}-{}.log", std::process::id()));
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .map_err(|e| StoreError::Io(format!("建日志文件失败: {e}")))?;
 
-    let run_id = store.start_run(action.id, &log_path.to_string_lossy())?;
+    let run_id = store.start_run(action_id, source, command, &log_path.to_string_lossy())?;
 
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-        .arg(&action.target)
-        .stdin(if action.needs_terminal {
+        .arg(command)
+        .stdin(if needs_terminal {
             Stdio::inherit()
         } else {
             Stdio::null()
@@ -266,6 +265,25 @@ fn run_command(store: &Store, action: &Action, echo_to_stdout: bool) -> Result<O
         exit_code: code,
         log_path,
     })
+}
+
+/// 用系统默认浏览器/打开器打开一个 URL 或路径。
+pub fn open_url(url: &str) -> Result<()> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let status = Command::new(opener)
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| StoreError::Io(format!("打不开链接 {url}: {e}")))?;
+    if !status.success() {
+        return Err(StoreError::Io(format!("打开链接失败: {url}")));
+    }
+    Ok(())
 }
 
 fn spawn_tee<R: Read + Send + 'static>(

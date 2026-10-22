@@ -1,12 +1,19 @@
 //! 渲染回归测试：用 ratatui 的 TestBackend 直接读渲染出来的缓冲，
 //! 断言的是"屏幕上真的有这些字/这些颜色"，而不是逻辑层。
 
-use kanban_core::{ActionKind, Store};
+use kanban_core::model::HOOK_ON_COMPLETE;
+use kanban_core::{ActionKind, ButtonKind, Store};
 use kanban_tui::app::{App, Mode};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use ratatui::Terminal;
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+fn press(app: &mut App, code: KeyCode) {
+    app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+}
 
 const W: u16 = 96;
 const H: u16 = 30;
@@ -208,4 +215,131 @@ fn search_result_screen_matches_what_is_typed() {
     );
     assert!(has(&lines, "写周报"));
     assert!(!has(&lines, "买菜"));
+}
+
+#[test]
+fn group_settings_panel_shows_config_fields_and_buttons() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    a.store
+        .set_group_config(gid, Some("/tmp/repo"), None, None)
+        .unwrap();
+    a.store
+        .add_group_button(
+            gid,
+            "工作区",
+            ButtonKind::Workspace,
+            "cmux {worktree}",
+            "",
+            false,
+        )
+        .unwrap();
+    a.refresh();
+
+    press(&mut a, KeyCode::Char('g'));
+    let lines = text(&draw(&mut a));
+
+    assert!(has(&lines, "分组设置"), "{lines:#?}");
+    assert!(has(&lines, "仓库"));
+    assert!(has(&lines, "/tmp/repo"));
+    assert!(has(&lines, "工作区"));
+    assert!(has(&lines, "cmux {worktree}"));
+}
+
+#[test]
+fn workspace_panel_lists_created_workspaces() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    let cid = a.store.create_card(gid, "有工作区的卡").unwrap();
+    a.store
+        .save_workspace(&kanban_core::CardWorkspace {
+            card_id: cid,
+            repo_path: "/tmp/repo".into(),
+            path: "/tmp/repo.worktrees/1-x".into(),
+            branch: "task/1-x".into(),
+            created_at: chrono::Local::now(),
+            last_opened_at: Some(chrono::Local::now()),
+        })
+        .unwrap();
+    a.refresh();
+
+    press(&mut a, KeyCode::Char('W'));
+    let lines = text(&draw(&mut a));
+
+    assert!(has(&lines, "工作区"), "{lines:#?}");
+    assert!(has(&lines, "有工作区的卡"));
+    assert!(has(&lines, "task/1-x"));
+}
+
+#[test]
+fn completing_a_card_with_confirm_hook_opens_a_confirmation() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    a.store
+        .set_group_config(gid, Some("/tmp/repo"), None, None)
+        .unwrap();
+    a.store
+        .add_group_hook(
+            gid,
+            HOOK_ON_COMPLETE,
+            "git worktree remove {worktree}",
+            true,
+        )
+        .unwrap();
+    a.store.create_card(gid, "要清理的卡").unwrap();
+    a.refresh();
+
+    press(&mut a, KeyCode::Char(' '));
+    let lines = text(&draw(&mut a));
+    assert!(a.confirm.is_some(), "应该弹确认框: {lines:#?}");
+    assert!(has(&lines, "要执行"));
+    assert!(has(&lines, "worktree remove"));
+
+    // y 确认后交给主循环执行
+    press(&mut a, KeyCode::Char('y'));
+    assert!(a.confirm.is_none());
+    assert!(a.pending_hooks.is_some());
+}
+
+#[test]
+fn card_front_shows_relation_count_and_workspace_badge() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    let a1 = a.store.create_card(gid, "父卡").unwrap();
+    let a2 = a.store.create_card(gid, "子卡").unwrap();
+    a.store
+        .add_relation(a1, a2, kanban_core::RelationKind::ParentChild)
+        .unwrap();
+    a.store
+        .save_workspace(&kanban_core::CardWorkspace {
+            card_id: a1,
+            repo_path: "/tmp/repo".into(),
+            path: "/tmp/repo.worktrees/1-x".into(),
+            branch: "task/1-x".into(),
+            created_at: chrono::Local::now(),
+            last_opened_at: None,
+        })
+        .unwrap();
+    a.refresh();
+
+    let lines = text(&draw(&mut a));
+    assert!(has(&lines, "⤷1"), "应显示关联数量: {lines:#?}");
+    assert!(has(&lines, "⎇"), "应显示工作区分支: {lines:#?}");
+}
+
+#[test]
+fn detail_shows_relation_section() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    let a1 = a.store.create_card(gid, "父卡").unwrap();
+    let a2 = a.store.create_card(gid, "子卡").unwrap();
+    a.store
+        .add_relation(a1, a2, kanban_core::RelationKind::ParentChild)
+        .unwrap();
+    a.refresh();
+
+    press(&mut a, KeyCode::Enter);
+    let lines = text(&draw(&mut a));
+    assert!(has(&lines, "关联"), "{lines:#?}");
+    assert!(has(&lines, "父 → 子卡"));
 }

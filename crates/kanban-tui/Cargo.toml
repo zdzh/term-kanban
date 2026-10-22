@@ -9,5 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 kanban-core = { path = "../kanban-core" }
+chrono.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

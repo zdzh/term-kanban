@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use kanban_core::{Action, ActionKind, Card, Group, Store, Subtask};
+use kanban_core::{
+    Action, ActionKind, ButtonKind, Card, CardWorkspace, Group, GroupButton, GroupHook, Relation,
+    Store, Subtask,
+};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -17,23 +20,73 @@ pub enum Mode {
     Board,
     Detail,
     Archive,
+    /// 分组设置：仓库、按钮、钩子
+    GroupSettings,
+    /// 所有活工作区总览
+    Workspaces,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Subtask,
     Action,
+    Relation,
+    Button,
 }
 
 pub struct DetailState {
     pub card: Card,
     pub subtasks: Vec<Subtask>,
     pub actions: Vec<Action>,
+    /// 关联：关系本身 + 对方的标题 + 是不是"我指向别人"
+    pub relations: Vec<(Relation, String, bool)>,
+    /// 所属分组的分组按钮（组内共享）
+    pub buttons: Vec<GroupButton>,
     pub focus: Focus,
     pub sel_sub: usize,
     pub sel_act: usize,
+    pub sel_rel: usize,
+    pub sel_btn: usize,
     pub body_scroll: u16,
     pub last_run: Option<String>,
+    pub workspace: Option<CardWorkspace>,
+}
+
+/// 分组设置面板的状态。
+pub struct SettingsState {
+    pub group_id: i64,
+    pub group_name: String,
+    pub repo: String,
+    pub worktree_root: String,
+    pub branch: String,
+    pub buttons: Vec<GroupButton>,
+    pub hooks: Vec<GroupHook>,
+    pub focus: SettingsFocus,
+    /// 0 = 仓库路径，1 = worktree 根，2 = 分支模板
+    pub field: usize,
+    pub sel: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsFocus {
+    Fields,
+    Buttons,
+    Hooks,
+}
+
+/// 工作区总览。
+pub struct WorkspacesState {
+    pub items: Vec<(CardWorkspace, String, String, bool)>,
+    pub sel: usize,
+    pub offset: usize,
+}
+
+/// 完成钩子的确认框。
+pub struct Confirm {
+    pub title: String,
+    pub card_id: i64,
+    pub commands: Vec<String>,
+    pub hook_ids: Vec<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,6 +99,12 @@ pub enum PromptKind {
     NewSubtask,
     NewCommand,
     NewLink,
+    GroupRepo,
+    GroupWorktreeRoot,
+    GroupBranch,
+    NewButton,
+    NewHook,
+    AddRelation,
 }
 
 pub struct Prompt {
@@ -64,6 +123,12 @@ impl Prompt {
             PromptKind::NewSubtask => "新子任务",
             PromptKind::NewCommand => "命令动作  格式：标签 | shell 命令",
             PromptKind::NewLink => "链接动作  格式：标签 | URL",
+            PromptKind::GroupRepo => "关联 git 仓库的绝对路径（留空清除）",
+            PromptKind::GroupWorktreeRoot => "worktree 根目录模板（留空用默认）",
+            PromptKind::GroupBranch => "分支名模板（留空用默认）",
+            PromptKind::NewButton => "分组按钮  格式：标签 | 工作区/命令/链接 | 模板",
+            PromptKind::NewHook => "完成钩子  命令模板（{worktree} 可用）",
+            PromptKind::AddRelation => "关联到哪张卡（输入编号或标题片段）",
         }
     }
 }
@@ -102,6 +167,18 @@ pub struct Drag {
 pub enum Effect {
     RunAction(i64),
     EditBody(i64),
+    /// 跑一个分组按钮（工作区按钮会先确保 worktree 存在）
+    RunGroupButton {
+        card_id: i64,
+        button_id: i64,
+    },
+    /// 跑完成钩子
+    RunHooks {
+        card_id: i64,
+        hook_ids: Vec<i64>,
+    },
+    /// 删掉某张卡的工作区
+    RemoveWorkspace(i64),
 }
 
 pub struct App {
@@ -131,6 +208,18 @@ pub struct App {
     pub card_actions: HashMap<i64, Vec<Action>>,
     /// 卡片正面要外显子任务清单，所以缓存整份列表。
     pub card_subtasks: HashMap<i64, Vec<Subtask>>,
+    /// 每个分组的分组按钮与钩子（按分组下标对齐）。
+    pub group_buttons: Vec<Vec<GroupButton>>,
+    pub group_hooks: Vec<Vec<GroupHook>>,
+    /// 卡片 → 工作区（分支名、脏状态）。
+    pub card_workspaces: HashMap<i64, (String, String, bool)>,
+    /// 卡片 → 关联数量，用于正面 `⤷N`。
+    pub relation_counts: HashMap<i64, usize>,
+    pub settings: Option<SettingsState>,
+    pub workspaces: Option<WorkspacesState>,
+    pub confirm: Option<Confirm>,
+    /// 待执行的钩子（无需确认时由主循环取走执行）
+    pub pending_hooks: Option<(i64, Vec<i64>)>,
     pub drag: Option<Drag>,
     /// 键盘拖拽：按 `m` 拿起的卡片，之后每次 hjkl 都是实移动。
     pub picked: Option<i64>,
@@ -162,6 +251,14 @@ impl App {
             hits: Vec::new(),
             card_actions: HashMap::new(),
             card_subtasks: HashMap::new(),
+            group_buttons: Vec::new(),
+            group_hooks: Vec::new(),
+            card_workspaces: HashMap::new(),
+            relation_counts: HashMap::new(),
+            settings: None,
+            workspaces: None,
+            confirm: None,
+            pending_hooks: None,
             drag: None,
             picked: None,
             toast: None,
@@ -182,8 +279,33 @@ impl App {
             .map(|g| self.store.cards_in_group(g.id, false).unwrap_or_default())
             .collect();
 
+        self.group_buttons = self
+            .groups
+            .iter()
+            .map(|g| self.store.group_buttons(g.id).unwrap_or_default())
+            .collect();
+        self.group_hooks = self
+            .groups
+            .iter()
+            .map(|g| self.store.group_hooks(g.id).unwrap_or_default())
+            .collect();
+
         self.card_actions.clear();
         self.card_subtasks.clear();
+        self.card_workspaces.clear();
+        self.relation_counts.clear();
+        for card in all.iter().flatten() {
+            if let Ok(Some(ws)) = self.store.workspace_for_card(card.id) {
+                let dirty = kanban_core::git::is_dirty(&ws.path);
+                self.card_workspaces
+                    .insert(card.id, (ws.path.clone(), ws.branch.clone(), dirty));
+            }
+            if let Ok(n) = self.store.relation_count(card.id) {
+                if n > 0 {
+                    self.relation_counts.insert(card.id, n);
+                }
+            }
+        }
         for card in all.iter().flatten() {
             let acts = self.store.actions(card.id).unwrap_or_default();
             if !acts.is_empty() {
@@ -264,6 +386,41 @@ impl App {
                     r.started_at.format("%m-%d %H:%M")
                 )
             });
+        let relations = self
+            .store
+            .relations_from(card_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                let title = self
+                    .store
+                    .card(r.to_card)
+                    .map(|c| c.title)
+                    .unwrap_or_else(|_| "（已删除）".into());
+                (r, title, true)
+            })
+            .chain(
+                self.store
+                    .relations_to(card_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| {
+                        let title = self
+                            .store
+                            .card(r.from_card)
+                            .map(|c| c.title)
+                            .unwrap_or_else(|_| "（已删除）".into());
+                        (r, title, false)
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let buttons = self
+            .groups
+            .iter()
+            .find(|g| g.id == card.group_id)
+            .map(|g| self.store.group_buttons(g.id).unwrap_or_default())
+            .unwrap_or_default();
+        let workspace = self.store.workspace_for_card(card_id).ok().flatten();
         let keep_focus = self
             .detail
             .as_ref()
@@ -282,15 +439,32 @@ impl App {
             .unwrap_or(0)
             .min(actions.len().saturating_sub(1));
         let body_scroll = self.detail.as_ref().map(|d| d.body_scroll).unwrap_or(0);
+        let sel_rel = self
+            .detail
+            .as_ref()
+            .map(|d| d.sel_rel)
+            .unwrap_or(0)
+            .min(relations.len().saturating_sub(1));
+        let sel_btn = self
+            .detail
+            .as_ref()
+            .map(|d| d.sel_btn)
+            .unwrap_or(0)
+            .min(buttons.len().saturating_sub(1));
         self.detail = Some(DetailState {
             card,
             subtasks,
             actions,
+            relations,
+            buttons,
             focus: keep_focus,
             sel_sub,
             sel_act,
+            sel_rel,
+            sel_btn,
             body_scroll,
             last_run,
+            workspace,
         });
     }
 
@@ -324,6 +498,9 @@ impl App {
     // ---------------- 键盘 ----------------
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        if self.confirm.is_some() {
+            return self.on_confirm_key(key);
+        }
         if self.prompt.is_some() {
             return self.on_prompt_key(key);
         }
@@ -331,6 +508,8 @@ impl App {
             Mode::Board => self.on_board_key(key),
             Mode::Detail => self.on_detail_key(key),
             Mode::Archive => self.on_archive_key(key),
+            Mode::GroupSettings => self.on_settings_key(key),
+            Mode::Workspaces => self.on_workspaces_key(key),
         }
     }
 
@@ -390,6 +569,126 @@ impl App {
         let text = buf.trim().to_string();
         match kind {
             PromptKind::Search => {}
+            PromptKind::GroupRepo | PromptKind::GroupWorktreeRoot | PromptKind::GroupBranch => {
+                let Some(st) = self.settings.as_ref() else {
+                    return;
+                };
+                let (repo, root, branch) = match kind {
+                    PromptKind::GroupRepo => {
+                        (text.clone(), st.worktree_root.clone(), st.branch.clone())
+                    }
+                    PromptKind::GroupWorktreeRoot => {
+                        (st.repo.clone(), text.clone(), st.branch.clone())
+                    }
+                    _ => (st.repo.clone(), st.worktree_root.clone(), text.clone()),
+                };
+                self.apply_settings_config(repo, root, branch);
+            }
+            PromptKind::NewButton => {
+                let Some(st) = self.settings.as_ref() else {
+                    return;
+                };
+                let gid = st.group_id;
+                let parts: Vec<&str> = text.split('|').map(|p| p.trim()).collect();
+                if parts.len() < 3 {
+                    self.toast("格式：标签 | 工作区/命令/链接 | 模板");
+                    return;
+                }
+                let (label, kind_s, tpl) = (parts[0], parts[1], parts[2]);
+                let kind = match kind_s {
+                    "工作区" | "workspace" => ButtonKind::Workspace,
+                    "命令" | "command" => ButtonKind::Command,
+                    "链接" | "link" => ButtonKind::Link,
+                    other => {
+                        self.toast(format!("不认识的按钮类型：{other}"));
+                        return;
+                    }
+                };
+                // 模板先拿假变量试渲染一次，拼错了现在就说
+                let probe = kanban_core::Vars {
+                    card_id: 1,
+                    title: "probe".into(),
+                    slug: "probe".into(),
+                    group: "g".into(),
+                    repo: "/tmp/repo".into(),
+                    repo_name: "repo".into(),
+                    worktree: "/tmp/repo.worktrees/1-probe".into(),
+                    branch: "task/1-probe".into(),
+                };
+                let rendered = if kind == ButtonKind::Link {
+                    kanban_core::template::render_display(tpl, &probe)
+                } else {
+                    kanban_core::template::render_command(tpl, &probe)
+                };
+                if let Err(e) = rendered {
+                    self.toast(format!("按钮模板有问题：{e}"));
+                    return;
+                }
+                let needs_terminal =
+                    kind == ButtonKind::Command && kanban_core::exec::infer_needs_terminal(tpl);
+                let (open_tpl, target) = if kind == ButtonKind::Workspace {
+                    (tpl, "")
+                } else {
+                    ("", tpl)
+                };
+                if let Err(e) =
+                    self.store
+                        .add_group_button(gid, label, kind, open_tpl, target, needs_terminal)
+                {
+                    self.toast(e.to_string());
+                }
+                self.reload_settings();
+            }
+            PromptKind::NewHook => {
+                let Some(st) = self.settings.as_ref() else {
+                    return;
+                };
+                let gid = st.group_id;
+                if text.is_empty() {
+                    return;
+                }
+                let probe = kanban_core::Vars {
+                    card_id: 1,
+                    title: "probe".into(),
+                    slug: "probe".into(),
+                    group: "g".into(),
+                    repo: "/tmp/repo".into(),
+                    repo_name: "repo".into(),
+                    worktree: "/tmp/repo.worktrees/1-probe".into(),
+                    branch: "task/1-probe".into(),
+                };
+                if let Err(e) = kanban_core::template::render_command(&text, &probe) {
+                    self.toast(format!("钩子模板有问题：{e}"));
+                    return;
+                }
+                if let Err(e) = self.store.add_group_hook(
+                    gid,
+                    kanban_core::model::HOOK_ON_COMPLETE,
+                    &text,
+                    true,
+                ) {
+                    self.toast(e.to_string());
+                }
+                self.reload_settings();
+            }
+            PromptKind::AddRelation => {
+                let Some(d) = &self.detail else { return };
+                let from = d.card.id;
+                let Some(to) = self.resolve_card(&text) else {
+                    self.toast("没找到匹配的卡片");
+                    return;
+                };
+                match self
+                    .store
+                    .add_relation(from, to, kanban_core::RelationKind::ParentChild)
+                {
+                    Ok(_) => {
+                        self.toast("已添加父子关联");
+                        self.refresh_detail_after();
+                    }
+                    Err(e) => self.toast(e.to_string()),
+                }
+            }
             PromptKind::NewCard => {
                 if text.is_empty() {
                     return;
@@ -565,6 +864,9 @@ impl App {
                     };
                 }
             }
+            KeyCode::Char('g') => self.open_settings(),
+            KeyCode::Char('w') => return self.run_first_workspace_button(),
+            KeyCode::Char('W') => self.open_workspaces(),
             KeyCode::Char('a') => self.archive_current_card(),
             KeyCode::Char('A') => self.archive_current_group(),
             KeyCode::Char('v') => {
@@ -612,7 +914,9 @@ impl App {
                 if let Some(d) = &mut self.detail {
                     d.focus = match d.focus {
                         Focus::Subtask => Focus::Action,
-                        Focus::Action => Focus::Subtask,
+                        Focus::Action => Focus::Relation,
+                        Focus::Relation => Focus::Button,
+                        Focus::Button => Focus::Subtask,
                     };
                 }
             }
@@ -639,6 +943,16 @@ impl App {
                                 d.sel_act += 1;
                             }
                         }
+                        Focus::Relation => {
+                            if d.sel_rel + 1 < d.relations.len() {
+                                d.sel_rel += 1;
+                            }
+                        }
+                        Focus::Button => {
+                            if d.sel_btn + 1 < d.buttons.len() {
+                                d.sel_btn += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -647,6 +961,8 @@ impl App {
                     match d.focus {
                         Focus::Subtask => d.sel_sub = d.sel_sub.saturating_sub(1),
                         Focus::Action => d.sel_act = d.sel_act.saturating_sub(1),
+                        Focus::Relation => d.sel_rel = d.sel_rel.saturating_sub(1),
+                        Focus::Button => d.sel_btn = d.sel_btn.saturating_sub(1),
                     }
                 }
             }
@@ -677,8 +993,16 @@ impl App {
                             return Some(Effect::RunAction(id));
                         }
                     }
+                    Some(Focus::Relation) => return self.jump_to_selected_relation(),
+                    Some(Focus::Button) => return self.run_selected_group_button(),
                     None => {}
                 }
+            }
+            KeyCode::Char('r') => {
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::AddRelation,
+                    buf: String::new(),
+                })
             }
             KeyCode::Char('J') => self.shift_in_focus(1),
             KeyCode::Char('K') => self.shift_in_focus(-1),
@@ -700,6 +1024,18 @@ impl App {
                             self.refresh_detail_after();
                         }
                     }
+                    Some(Focus::Relation) => {
+                        if let Some((rel, _, _)) = self
+                            .detail
+                            .as_ref()
+                            .and_then(|d| d.relations.get(d.sel_rel))
+                        {
+                            let id = rel.id;
+                            let _ = self.store.delete_relation(id);
+                            self.refresh_detail_after();
+                        }
+                    }
+                    Some(Focus::Button) => {}
                     None => {}
                 }
             }
@@ -832,12 +1168,62 @@ impl App {
     // ---------------- 动作 ----------------
 
     fn toggle_done(&mut self) {
-        if let Some(c) = self.current_card() {
-            let (id, done) = (c.id, c.done);
-            if let Err(e) = self.store.set_done(id, !done) {
-                self.toast(e.to_string());
+        let Some(c) = self.current_card() else { return };
+        let (id, done) = (c.id, c.done);
+        if let Err(e) = self.store.set_done(id, !done) {
+            self.toast(e.to_string());
+            return;
+        }
+        self.refresh();
+
+        // 只有「未完成 → 完成」这一次触发钩子；取消勾选不跑反向操作
+        if !done {
+            self.trigger_completion_hooks(id);
+        }
+    }
+
+    /// 勾上后看这个分组有没有 on_complete 钩子：要确认的先弹框，否则直接跑。
+    fn trigger_completion_hooks(&mut self, card_id: i64) {
+        let Ok(card) = self.store.card(card_id) else {
+            return;
+        };
+        let Some(group) = self.store.group(card.group_id).ok() else {
+            return;
+        };
+        let hooks: Vec<GroupHook> = self
+            .store
+            .group_hooks(group.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| h.event == kanban_core::model::HOOK_ON_COMPLETE)
+            .collect();
+        if hooks.is_empty() {
+            return;
+        }
+
+        let mut commands = Vec::new();
+        for h in &hooks {
+            match kanban_core::workspace::hook_command(h, &group, &card) {
+                Ok(c) => commands.push(c),
+                Err(e) => {
+                    self.toast(e.to_string());
+                    return;
+                }
             }
-            self.refresh();
+        }
+
+        let needs_confirm = hooks.iter().any(|h| h.confirm);
+        let hook_ids: Vec<i64> = hooks.iter().map(|h| h.id).collect();
+
+        if needs_confirm {
+            self.confirm = Some(Confirm {
+                title: format!("完成「{}」要执行清理命令", card.title),
+                card_id,
+                commands,
+                hook_ids,
+            });
+        } else {
+            self.pending_hooks = Some((card_id, hook_ids));
         }
     }
 
@@ -912,6 +1298,7 @@ impl App {
                     let _ = self.store.shift_action(a.id, delta);
                 }
             }
+            Focus::Relation | Focus::Button => return,
         }
         self.refresh_detail_after();
     }
@@ -1147,6 +1534,424 @@ fn short(target: &str) -> String {
         format!("{s}…")
     } else {
         s
+    }
+}
+
+impl App {
+    // ---------------- 完成钩子确认框 ----------------
+
+    fn on_confirm_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(c) = self.confirm.take() {
+                    self.pending_hooks = Some((c.card_id, c.hook_ids));
+                }
+            }
+            _ => {
+                self.confirm = None;
+                self.toast("已取消清理命令");
+            }
+        }
+        None
+    }
+
+    // ---------------- 分组设置 ----------------
+
+    fn open_settings(&mut self) {
+        let Some(g) = self.groups.get(self.sel_g) else {
+            return;
+        };
+        let buttons = self.store.group_buttons(g.id).unwrap_or_default();
+        let hooks = self.store.group_hooks(g.id).unwrap_or_default();
+        self.settings = Some(SettingsState {
+            group_id: g.id,
+            group_name: g.name.clone(),
+            repo: g.repo_path.clone().unwrap_or_default(),
+            worktree_root: g.worktree_root.clone().unwrap_or_default(),
+            branch: g.branch_template.clone().unwrap_or_default(),
+            buttons,
+            hooks,
+            focus: SettingsFocus::Fields,
+            field: 0,
+            sel: 0,
+        });
+        self.mode = Mode::GroupSettings;
+    }
+
+    fn reload_settings(&mut self) {
+        let Some(st) = &self.settings else { return };
+        let (gid, focus, field, sel) = (st.group_id, st.focus, st.field, st.sel);
+        let Ok(g) = self.store.group(gid) else { return };
+        let buttons = self.store.group_buttons(gid).unwrap_or_default();
+        let hooks = self.store.group_hooks(gid).unwrap_or_default();
+        self.settings = Some(SettingsState {
+            group_id: gid,
+            group_name: g.name.clone(),
+            repo: g.repo_path.clone().unwrap_or_default(),
+            worktree_root: g.worktree_root.clone().unwrap_or_default(),
+            branch: g.branch_template.clone().unwrap_or_default(),
+            buttons,
+            hooks,
+            focus,
+            field,
+            sel,
+        });
+        self.refresh();
+    }
+
+    fn on_settings_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        let Some(st) = &self.settings else {
+            self.mode = Mode::Board;
+            return None;
+        };
+        let focus = st.focus;
+        let len = match focus {
+            SettingsFocus::Fields => 3,
+            SettingsFocus::Buttons => st.buttons.len(),
+            SettingsFocus::Hooks => st.hooks.len(),
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Board;
+                self.settings = None;
+                self.refresh();
+            }
+            KeyCode::Tab => {
+                let next = match focus {
+                    SettingsFocus::Fields => SettingsFocus::Buttons,
+                    SettingsFocus::Buttons => SettingsFocus::Hooks,
+                    SettingsFocus::Hooks => SettingsFocus::Fields,
+                };
+                if let Some(st) = &mut self.settings {
+                    st.focus = next;
+                    st.sel = 0;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(st) = &mut self.settings {
+                    match st.focus {
+                        SettingsFocus::Fields => st.field = (st.field + 1) % 3,
+                        _ => {
+                            if st.sel + 1 < len {
+                                st.sel += 1
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(st) = &mut self.settings {
+                    match st.focus {
+                        SettingsFocus::Fields => st.field = (st.field + 2) % 3,
+                        _ => st.sel = st.sel.saturating_sub(1),
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let st = self.settings.as_ref()?;
+                match focus {
+                    SettingsFocus::Fields => {
+                        let (kind, buf) = match st.field {
+                            0 => (PromptKind::GroupRepo, st.repo.clone()),
+                            1 => (PromptKind::GroupWorktreeRoot, st.worktree_root.clone()),
+                            _ => (PromptKind::GroupBranch, st.branch.clone()),
+                        };
+                        self.prompt = Some(Prompt { kind, buf });
+                    }
+                    SettingsFocus::Hooks => self.toggle_hook_confirm(),
+                    SettingsFocus::Buttons => {
+                        // 直接拿当前卡试跑一下这个按钮
+                        return self.run_button_from_settings();
+                    }
+                }
+            }
+            KeyCode::Char('a') => match focus {
+                SettingsFocus::Buttons => {
+                    self.prompt = Some(Prompt {
+                        kind: PromptKind::NewButton,
+                        buf: String::new(),
+                    })
+                }
+                SettingsFocus::Hooks => {
+                    self.prompt = Some(Prompt {
+                        kind: PromptKind::NewHook,
+                        buf: String::new(),
+                    })
+                }
+                SettingsFocus::Fields => {}
+            },
+            KeyCode::Char('d') => match focus {
+                SettingsFocus::Buttons => {
+                    if let Some(b) = self.settings.as_ref().and_then(|s| s.buttons.get(s.sel)) {
+                        let id = b.id;
+                        let _ = self.store.delete_group_button(id);
+                        self.reload_settings();
+                    }
+                }
+                SettingsFocus::Hooks => {
+                    if let Some(h) = self.settings.as_ref().and_then(|s| s.hooks.get(s.sel)) {
+                        let id = h.id;
+                        let _ = self.store.delete_group_hook(id);
+                        self.reload_settings();
+                    }
+                }
+                SettingsFocus::Fields => {}
+            },
+            KeyCode::Char('J') | KeyCode::Char('K') => {
+                if focus == SettingsFocus::Buttons {
+                    let delta = if matches!(key.code, KeyCode::Char('J')) {
+                        1
+                    } else {
+                        -1
+                    };
+                    if let Some(b) = self.settings.as_ref().and_then(|s| s.buttons.get(s.sel)) {
+                        let id = b.id;
+                        let _ = self.store.shift_group_button(id, delta);
+                        self.reload_settings();
+                    }
+                }
+            }
+            KeyCode::Char('T') => {
+                if focus == SettingsFocus::Buttons {
+                    self.toggle_button_terminal();
+                } else if focus == SettingsFocus::Hooks {
+                    self.toggle_hook_confirm();
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn toggle_hook_confirm(&mut self) {
+        let Some(h) = self.settings.as_ref().and_then(|s| s.hooks.get(s.sel)) else {
+            return;
+        };
+        let (id, confirm) = (h.id, h.confirm);
+        let _ = self.store.delete_group_hook(id).and_then(|_| {
+            self.store.add_group_hook(
+                self.settings.as_ref().unwrap().group_id,
+                kanban_core::model::HOOK_ON_COMPLETE,
+                &h.run,
+                !confirm,
+            )
+        });
+        let msg = if confirm {
+            "已改为直接执行（不提示）"
+        } else {
+            "已改为执行前提示"
+        };
+        self.toast(msg);
+        self.reload_settings();
+    }
+
+    fn toggle_button_terminal(&mut self) {
+        let Some(b) = self.settings.as_ref().and_then(|s| s.buttons.get(s.sel)) else {
+            return;
+        };
+        if b.kind == ButtonKind::Link {
+            self.toast("链接按钮不需要终端");
+            return;
+        }
+        let (id, needs) = (b.id, b.needs_terminal);
+        let _ = self.store.set_group_button_terminal(id, !needs);
+        self.reload_settings();
+    }
+
+    fn run_button_from_settings(&mut self) -> Option<Effect> {
+        let st = self.settings.as_ref()?;
+        let button = st.buttons.get(st.sel)?;
+        let button_id = button.id;
+        // 用这个分组里第一张卡试跑
+        let group_id = st.group_id;
+        let card_id = self
+            .cards
+            .iter()
+            .flatten()
+            .find(|c| c.group_id == group_id)
+            .map(|c| c.id)?;
+        Some(Effect::RunGroupButton { card_id, button_id })
+    }
+
+    // ---------------- 工作区总览 ----------------
+
+    fn open_workspaces(&mut self) {
+        let items = self
+            .store
+            .all_workspaces()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(ws, title, group)| {
+                let dirty = kanban_core::git::is_dirty(&ws.path);
+                (ws, title, group, dirty)
+            })
+            .collect();
+        self.workspaces = Some(WorkspacesState {
+            items,
+            sel: 0,
+            offset: 0,
+        });
+        self.mode = Mode::Workspaces;
+    }
+
+    fn on_workspaces_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        let Some(ws) = &self.workspaces else {
+            self.mode = Mode::Board;
+            return None;
+        };
+        let len = ws.items.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('W') => {
+                self.mode = Mode::Board;
+                self.workspaces = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(ws) = &mut self.workspaces {
+                    if ws.sel + 1 < len {
+                        ws.sel += 1;
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(ws) = &mut self.workspaces {
+                    ws.sel = ws.sel.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('o') => {
+                let card_id = self
+                    .workspaces
+                    .as_ref()?
+                    .items
+                    .get(self.workspaces.as_ref()?.sel)?
+                    .0
+                    .card_id;
+                self.mode = Mode::Board;
+                self.workspaces = None;
+                return self.run_first_workspace_button_for(card_id);
+            }
+            KeyCode::Char('d') => {
+                let card_id = self
+                    .workspaces
+                    .as_ref()?
+                    .items
+                    .get(self.workspaces.as_ref()?.sel)?
+                    .0
+                    .card_id;
+                return Some(Effect::RemoveWorkspace(card_id));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    // ---------------- 跳转 ----------------
+
+    fn run_first_workspace_button(&mut self) -> Option<Effect> {
+        let card_id = self.current_card_id()?;
+        self.run_first_workspace_button_for(card_id)
+    }
+
+    fn run_first_workspace_button_for(&mut self, card_id: i64) -> Option<Effect> {
+        let card = self.store.card(card_id).ok()?;
+        let buttons = self.store.group_buttons(card.group_id).ok()?;
+        let button = buttons.iter().find(|b| b.kind == ButtonKind::Workspace)?;
+        Some(Effect::RunGroupButton {
+            card_id,
+            button_id: button.id,
+        })
+    }
+
+    fn run_selected_group_button(&mut self) -> Option<Effect> {
+        let d = self.detail.as_ref()?;
+        let button = d.buttons.get(d.sel_btn)?;
+        Some(Effect::RunGroupButton {
+            card_id: d.card.id,
+            button_id: button.id,
+        })
+    }
+
+    fn jump_to_selected_relation(&mut self) -> Option<Effect> {
+        let d = self.detail.as_ref()?;
+        let (rel, _, outgoing) = d.relations.get(d.sel_rel)?;
+        let target = if *outgoing {
+            rel.to_card
+        } else {
+            rel.from_card
+        };
+        self.jump_to_card(target);
+        None
+    }
+
+    /// 跳到某张卡：先清筛选（否则目标可能被筛掉），再切分组、选中、开详情。
+    pub fn jump_to_card(&mut self, card_id: i64) {
+        if self.filter.is_some() {
+            self.filter = None;
+            self.refresh();
+        }
+        for (gi, cards) in self.cards.iter().enumerate() {
+            if let Some(ci) = cards.iter().position(|c| c.id == card_id) {
+                self.sel_g = gi;
+                self.sel_c = ci;
+                self.mode = Mode::Board;
+                self.open_detail();
+                return;
+            }
+        }
+        // 不在当前看板（可能已归档）
+        if let Ok(card) = self.store.card(card_id) {
+            if card.archived_at.is_some() {
+                self.toast("这张卡已归档，去归档视图看");
+            } else if let Some(gid) = self.store.group(card.group_id).ok().map(|g| g.id) {
+                let name = self.store.group(gid).map(|g| g.name).unwrap_or_default();
+                self.toast(format!("「{}」在分组「{name}」里，先恢复分组", card.title));
+            }
+        }
+    }
+
+    /// 按编号或标题片段找一张卡（关联输入框用）。
+    pub fn resolve_card(&self, query: &str) -> Option<i64> {
+        let q = query.trim();
+        if let Ok(id) = q.parse::<i64>() {
+            if self.store.card(id).is_ok() {
+                return Some(id);
+            }
+        }
+        if q.is_empty() {
+            return None;
+        }
+        let needle = q.to_lowercase();
+        self.cards
+            .iter()
+            .flatten()
+            .find(|c| c.title.to_lowercase().contains(&needle))
+            .map(|c| c.id)
+    }
+
+    /// 设置面板里改完配置后统一落库（先校验）。
+    fn apply_settings_config(&mut self, repo: String, root: String, branch: String) -> bool {
+        let Some(st) = &self.settings else {
+            return false;
+        };
+        let gid = st.group_id;
+        if let Err(e) =
+            kanban_core::workspace::validate_group_config(Some(&repo), Some(&root), Some(&branch))
+        {
+            self.toast(e.to_string());
+            return false;
+        }
+        let empty = |s: &str| s.trim().is_empty();
+        if let Err(e) = self.store.set_group_config(
+            gid,
+            if empty(&repo) { None } else { Some(&repo) },
+            if empty(&root) { None } else { Some(&root) },
+            if empty(&branch) { None } else { Some(&branch) },
+        ) {
+            self.toast(e.to_string());
+            return false;
+        }
+        self.reload_settings();
+        true
     }
 }
 

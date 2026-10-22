@@ -45,6 +45,8 @@ fn run(terminal: &mut Tui, app: &mut app::App) -> io::Result<()> {
         app.tick();
         terminal.draw(|f| ui::render(app, f))?;
 
+        drain_pending_hooks(app);
+
         if !event::poll(std::time::Duration::from_millis(200))? {
             if app.should_quit {
                 return Ok(());
@@ -76,8 +78,171 @@ fn apply(terminal: &mut Tui, app: &mut app::App, effect: app::Effect) -> io::Res
     match effect {
         app::Effect::RunAction(id) => run_action(terminal, app, id)?,
         app::Effect::EditBody(id) => edit_body(terminal, app, id)?,
+        app::Effect::RunGroupButton { card_id, button_id } => {
+            run_group_button(terminal, app, card_id, button_id)?
+        }
+        app::Effect::RunHooks { card_id, hook_ids } => run_hooks(app, card_id, &hook_ids),
+        app::Effect::RemoveWorkspace(card_id) => remove_workspace(app, card_id),
     }
     Ok(())
+}
+
+/// 完成钩子：需要确认的走确认框，确认后从 pending_hooks 取出执行。
+fn drain_pending_hooks(app: &mut app::App) {
+    if let Some((card_id, ids)) = app.pending_hooks.take() {
+        run_hooks(app, card_id, &ids);
+    }
+}
+
+fn run_hooks(app: &mut app::App, card_id: i64, hook_ids: &[i64]) {
+    let Ok(card) = app.store.card(card_id) else {
+        return;
+    };
+    let Ok(group) = app.store.group(card.group_id) else {
+        return;
+    };
+    let hooks = app.store.group_hooks(group.id).unwrap_or_default();
+    let mut ok = 0;
+    let mut failed: Vec<String> = Vec::new();
+
+    for id in hook_ids {
+        let Some(hook) = hooks.iter().find(|h| h.id == *id) else {
+            continue;
+        };
+        match kanban_core::workspace::run_hook(&app.store, hook, &group, &card, false) {
+            Ok(kanban_core::exec::Outcome::Finished { exit_code, .. }) => match exit_code {
+                Some(0) => ok += 1,
+                other => failed.push(format!(
+                    "退出码 {}",
+                    other
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "被信号终止".into())
+                )),
+            },
+            Ok(_) => ok += 1,
+            Err(e) => failed.push(e.to_string()),
+        }
+    }
+
+    if failed.is_empty() {
+        app.toast(format!("完成钩子执行成功（{ok} 条）"));
+    } else {
+        app.toast(format!("钩子失败：{}", failed.join("；")));
+    }
+    app.refresh();
+}
+
+fn run_group_button(
+    terminal: &mut Tui,
+    app: &mut app::App,
+    card_id: i64,
+    button_id: i64,
+) -> io::Result<()> {
+    let card = match app.store.card(card_id) {
+        Ok(c) => c,
+        Err(e) => {
+            app.toast(e.to_string());
+            return Ok(());
+        }
+    };
+    let group = match app.store.group(card.group_id) {
+        Ok(g) => g,
+        Err(e) => {
+            app.toast(e.to_string());
+            return Ok(());
+        }
+    };
+    let button = app
+        .store
+        .group_buttons(group.id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|b| b.id == button_id);
+    let Some(button) = button else {
+        app.toast("按钮已不存在");
+        return Ok(());
+    };
+
+    let had_workspace = app
+        .store
+        .workspace_for_card(card_id)
+        .ok()
+        .flatten()
+        .is_some();
+    let needs_terminal = button.needs_terminal;
+
+    if needs_terminal {
+        suspend(terminal)?;
+        println!();
+        println!("[{}] {}", button.label, button.command());
+        println!("{}", "─".repeat(60));
+        let _ = io::stdout().flush();
+    }
+
+    let outcome = kanban_core::workspace::run_group_button(
+        &app.store,
+        &group,
+        &card,
+        &button,
+        needs_terminal,
+    );
+
+    if needs_terminal {
+        println!();
+        println!("按回车返回看板…");
+        let _ = io::stdout().flush();
+        wait_enter();
+        resume(terminal)?;
+    }
+
+    match outcome {
+        Ok(kanban_core::exec::Outcome::LinkOpened) => app.toast("已打开链接"),
+        Ok(kanban_core::exec::Outcome::Finished { exit_code, .. }) => {
+            if button.kind == kanban_core::ButtonKind::Workspace {
+                let ws = app.store.workspace_for_card(card_id).ok().flatten();
+                let path = ws.map(|w| w.path).unwrap_or_default();
+                if had_workspace {
+                    app.toast(format!("已打开工作区 {path}"));
+                } else {
+                    app.toast(format!("已创建工作区 {path}"));
+                }
+            } else {
+                match exit_code {
+                    Some(0) => app.toast(format!("「{}」执行成功", button.label)),
+                    other => app.toast(format!(
+                        "「{}」退出码 {}",
+                        button.label,
+                        other
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "被信号终止".into())
+                    )),
+                }
+            }
+        }
+        Err(e) => app.toast(e.to_string()),
+    }
+
+    app.refresh();
+    Ok(())
+}
+
+fn remove_workspace(app: &mut app::App, card_id: i64) {
+    let Ok(Some(ws)) = app.store.workspace_for_card(card_id) else {
+        app.toast("这张卡没有工作区");
+        return;
+    };
+    if kanban_core::git::is_dirty(&ws.path) {
+        app.toast("工作区里有未提交的改动，先处理再删");
+        return;
+    }
+    match kanban_core::git::worktree_remove(&ws.repo_path, &ws.path, false) {
+        Ok(()) => {
+            let _ = app.store.delete_workspace(card_id);
+            app.toast("工作区已删除");
+        }
+        Err(e) => app.toast(e.to_string()),
+    }
+    app.refresh();
 }
 
 fn suspend(terminal: &mut Tui) -> io::Result<()> {
