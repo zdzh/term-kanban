@@ -383,3 +383,153 @@ fn settings_panel_has_visible_section_separators() {
         assert!(line.matches('─').count() > 20, "分隔线太短: {line:?}");
     }
 }
+
+#[test]
+fn button_editor_is_a_form_not_a_pipe_dsl() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    a.store
+        .set_group_config(gid, Some("/tmp/repo"), None, None)
+        .unwrap();
+    a.refresh();
+
+    // g → Tab 到按钮 → a 新建
+    press(&mut a, KeyCode::Char('g'));
+    press(&mut a, KeyCode::Tab);
+    press(&mut a, KeyCode::Char('a'));
+    let lines = text(&draw(&mut a));
+    assert!(has(&lines, "新建按钮"), "{lines:#?}");
+    // 四个字段各自一行，不是一行三段
+    for f in ["标签", "类型", "打开命令", "需要终端"] {
+        assert!(has(&lines, f), "缺少字段 {f}: {lines:#?}");
+    }
+
+    // 填标签
+    press(&mut a, KeyCode::Enter);
+    for c in "错误日志".chars() {
+        press(&mut a, KeyCode::Char(c));
+    }
+    press(&mut a, KeyCode::Enter);
+    // 类型 → 命令
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Enter);
+    // 命令里带 shell 管道
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Enter);
+    for c in "tail -50 app.log | grep ERROR".chars() {
+        press(&mut a, KeyCode::Char(c));
+    }
+    press(&mut a, KeyCode::Enter);
+    press(&mut a, KeyCode::Char('s'));
+
+    let buttons = a.store.group_buttons(gid).unwrap();
+    assert_eq!(buttons.len(), 1);
+    assert_eq!(buttons[0].label, "错误日志");
+    assert_eq!(buttons[0].kind, ButtonKind::Command);
+    // 管道没被当成分隔符切掉
+    assert_eq!(buttons[0].target, "tail -50 app.log | grep ERROR");
+}
+
+#[test]
+fn button_editor_rejects_bad_template_and_keeps_the_draft() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    a.store
+        .set_group_config(gid, Some("/tmp/repo"), None, None)
+        .unwrap();
+    a.refresh();
+
+    press(&mut a, KeyCode::Char('g'));
+    press(&mut a, KeyCode::Tab);
+    press(&mut a, KeyCode::Char('a'));
+    press(&mut a, KeyCode::Enter); // 标签
+    press(&mut a, KeyCode::Char('x'));
+    press(&mut a, KeyCode::Enter);
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Enter); // 模板
+    for c in "echo {nope}".chars() {
+        press(&mut a, KeyCode::Char(c));
+    }
+    press(&mut a, KeyCode::Enter);
+    press(&mut a, KeyCode::Char('s'));
+
+    // 没落库，且草稿还在、带错误提示
+    assert!(a.store.group_buttons(gid).unwrap().is_empty());
+    let draft = a.entry.as_ref().expect("草稿应该保留");
+    assert!(draft.error.as_deref().unwrap_or("").contains("未知变量"));
+}
+
+#[test]
+fn existing_button_can_be_edited_in_place() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    a.store
+        .set_group_config(gid, Some("/tmp/repo"), None, None)
+        .unwrap();
+    let id = a
+        .store
+        .add_group_button(
+            gid,
+            "工作区",
+            ButtonKind::Workspace,
+            "cmux {worktree}",
+            "",
+            false,
+        )
+        .unwrap();
+    a.refresh();
+
+    press(&mut a, KeyCode::Char('g'));
+    press(&mut a, KeyCode::Tab);
+    press(&mut a, KeyCode::Enter); // 编辑第一个按钮
+    let lines = text(&draw(&mut a));
+    assert!(has(&lines, "编辑按钮"), "{lines:#?}");
+    assert!(has(&lines, "cmux {worktree}"), "应带出原模板: {lines:#?}");
+
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Char('j'));
+    press(&mut a, KeyCode::Enter);
+    // 清空重打
+    for _ in 0.."cmux {worktree}".len() {
+        press(&mut a, KeyCode::Backspace);
+    }
+    for c in "code {worktree}".chars() {
+        press(&mut a, KeyCode::Char(c));
+    }
+    press(&mut a, KeyCode::Enter);
+    press(&mut a, KeyCode::Char('s'));
+
+    let buttons = a.store.group_buttons(gid).unwrap();
+    assert_eq!(buttons.len(), 1, "编辑不该新增一条");
+    assert_eq!(buttons[0].id, id);
+    assert_eq!(buttons[0].open_template, "code {worktree}");
+}
+
+#[test]
+fn hook_editor_has_its_own_fields() {
+    let mut a = app();
+    let gid = a.groups[0].id;
+    a.refresh();
+    press(&mut a, KeyCode::Char('g'));
+    press(&mut a, KeyCode::Tab);
+    press(&mut a, KeyCode::Tab); // 到钩子
+    press(&mut a, KeyCode::Char('a'));
+
+    let lines = text(&draw(&mut a));
+    assert!(has(&lines, "新建完成钩子"), "{lines:#?}");
+    assert!(has(&lines, "命令"), "{lines:#?}");
+    assert!(has(&lines, "执行前提示"), "{lines:#?}");
+
+    press(&mut a, KeyCode::Enter);
+    for c in "echo done".chars() {
+        press(&mut a, KeyCode::Char(c));
+    }
+    press(&mut a, KeyCode::Enter);
+    press(&mut a, KeyCode::Char('s'));
+
+    let hooks = a.store.group_hooks(gid).unwrap();
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0].run, "echo done");
+    assert!(hooks[0].confirm);
+}

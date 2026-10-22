@@ -834,6 +834,31 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_group_button(
+        &self,
+        id: i64,
+        label: &str,
+        kind: ButtonKind,
+        open_template: &str,
+        target: &str,
+        needs_terminal: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE group_buttons
+             SET label=?2, kind=?3, open_template=?4, target=?5, needs_terminal=?6
+             WHERE id=?1",
+            params![
+                id,
+                label,
+                kind.as_str(),
+                open_template,
+                target,
+                needs_terminal as i64
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_group_button(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM group_buttons WHERE id=?1", params![id])?;
@@ -907,6 +932,14 @@ impl Store {
             params![group_id, event, run, confirm as i64, pos],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_group_hook(&self, id: i64, run: &str, confirm: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE group_hooks SET run=?2, confirm=?3 WHERE id=?1",
+            params![id, run, confirm as i64],
+        )?;
+        Ok(())
     }
 
     pub fn delete_group_hook(&self, id: i64) -> Result<()> {

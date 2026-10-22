@@ -24,6 +24,78 @@ pub enum Mode {
     GroupSettings,
     /// 所有活工作区总览
     Workspaces,
+    /// 按钮 / 钩子的表单编辑
+    EntryEditor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftKind {
+    Button,
+    Hook,
+}
+
+/// 按钮/钩子的编辑草稿。字段编辑先进草稿，`s` 才落库——避免半截配置写进数据库。
+pub struct EntryDraft {
+    pub kind: DraftKind,
+    /// 正在改已有条目时是它的 id，新建时为 None
+    pub editing_id: Option<i64>,
+    pub group_id: i64,
+    pub label: String,
+    pub button_kind: ButtonKind,
+    pub template: String,
+    pub needs_terminal: bool,
+    pub confirm: bool,
+    pub field: usize,
+    pub error: Option<String>,
+}
+
+impl EntryDraft {
+    pub fn fields(&self) -> Vec<(&'static str, String)> {
+        match self.kind {
+            DraftKind::Button => vec![
+                ("标签", self.label.clone()),
+                ("类型", kind_label(self.button_kind).to_string()),
+                (
+                    match self.button_kind {
+                        ButtonKind::Workspace => "打开命令",
+                        ButtonKind::Command => "命令",
+                        ButtonKind::Link => "URL",
+                    },
+                    self.template.clone(),
+                ),
+                (
+                    "需要终端",
+                    if self.needs_terminal { "是" } else { "否" }.to_string(),
+                ),
+            ],
+            DraftKind::Hook => vec![
+                ("命令", self.template.clone()),
+                (
+                    "执行前提示",
+                    if self.confirm { "是" } else { "否" }.to_string(),
+                ),
+            ],
+        }
+    }
+
+    pub fn is_text_field_public(&self, idx: usize) -> bool {
+        self.is_text_field(idx)
+    }
+
+    fn is_text_field(&self, idx: usize) -> bool {
+        match self.kind {
+            DraftKind::Button => matches!(idx, 0 | 2),
+            DraftKind::Hook => idx == 0,
+        }
+    }
+}
+
+fn kind_label(k: ButtonKind) -> &'static str {
+    match k {
+        ButtonKind::Workspace => "工作区",
+        ButtonKind::Command => "命令",
+        ButtonKind::Link => "链接",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +174,7 @@ pub enum PromptKind {
     GroupRepo,
     GroupWorktreeRoot,
     GroupBranch,
-    NewButton,
-    NewHook,
+    EntryField,
     AddRelation,
 }
 
@@ -126,8 +197,7 @@ impl Prompt {
             PromptKind::GroupRepo => "关联 git 仓库的绝对路径（留空清除）",
             PromptKind::GroupWorktreeRoot => "worktree 根目录模板（留空用默认）",
             PromptKind::GroupBranch => "分支名模板（留空用默认）",
-            PromptKind::NewButton => "分组按钮  格式：标签 | 工作区/命令/链接 | 模板",
-            PromptKind::NewHook => "完成钩子  命令模板（{worktree} 可用）",
+            PromptKind::EntryField => "编辑字段（Enter 确认 Esc 取消）",
             PromptKind::AddRelation => "关联到哪张卡（输入编号或标题片段）",
         }
     }
@@ -218,6 +288,7 @@ pub struct App {
     pub settings: Option<SettingsState>,
     pub workspaces: Option<WorkspacesState>,
     pub confirm: Option<Confirm>,
+    pub entry: Option<EntryDraft>,
     /// 待执行的钩子（无需确认时由主循环取走执行）
     pub pending_hooks: Option<(i64, Vec<i64>)>,
     pub drag: Option<Drag>,
@@ -258,6 +329,7 @@ impl App {
             settings: None,
             workspaces: None,
             confirm: None,
+            entry: None,
             pending_hooks: None,
             drag: None,
             picked: None,
@@ -510,6 +582,7 @@ impl App {
             Mode::Archive => self.on_archive_key(key),
             Mode::GroupSettings => self.on_settings_key(key),
             Mode::Workspaces => self.on_workspaces_key(key),
+            Mode::EntryEditor => self.on_entry_key(key),
         }
     }
 
@@ -569,6 +642,10 @@ impl App {
         let text = buf.trim().to_string();
         match kind {
             PromptKind::Search => {}
+            PromptKind::EntryField => {
+                let value = buf.clone();
+                self.apply_entry_field(value);
+            }
             PromptKind::GroupRepo | PromptKind::GroupWorktreeRoot | PromptKind::GroupBranch => {
                 let Some(st) = self.settings.as_ref() else {
                     return;
@@ -583,93 +660,6 @@ impl App {
                     _ => (st.repo.clone(), st.worktree_root.clone(), text.clone()),
                 };
                 self.apply_settings_config(repo, root, branch);
-            }
-            PromptKind::NewButton => {
-                let Some(st) = self.settings.as_ref() else {
-                    return;
-                };
-                let gid = st.group_id;
-                let parts: Vec<&str> = text.split('|').map(|p| p.trim()).collect();
-                if parts.len() < 3 {
-                    self.toast("格式：标签 | 工作区/命令/链接 | 模板");
-                    return;
-                }
-                let (label, kind_s, tpl) = (parts[0], parts[1], parts[2]);
-                let kind = match kind_s {
-                    "工作区" | "workspace" => ButtonKind::Workspace,
-                    "命令" | "command" => ButtonKind::Command,
-                    "链接" | "link" => ButtonKind::Link,
-                    other => {
-                        self.toast(format!("不认识的按钮类型：{other}"));
-                        return;
-                    }
-                };
-                // 模板先拿假变量试渲染一次，拼错了现在就说
-                let probe = kanban_core::Vars {
-                    card_id: 1,
-                    title: "probe".into(),
-                    slug: "probe".into(),
-                    group: "g".into(),
-                    repo: "/tmp/repo".into(),
-                    repo_name: "repo".into(),
-                    worktree: "/tmp/repo.worktrees/1-probe".into(),
-                    branch: "task/1-probe".into(),
-                };
-                let rendered = if kind == ButtonKind::Link {
-                    kanban_core::template::render_display(tpl, &probe)
-                } else {
-                    kanban_core::template::render_command(tpl, &probe)
-                };
-                if let Err(e) = rendered {
-                    self.toast(format!("按钮模板有问题：{e}"));
-                    return;
-                }
-                let needs_terminal =
-                    kind == ButtonKind::Command && kanban_core::exec::infer_needs_terminal(tpl);
-                let (open_tpl, target) = if kind == ButtonKind::Workspace {
-                    (tpl, "")
-                } else {
-                    ("", tpl)
-                };
-                if let Err(e) =
-                    self.store
-                        .add_group_button(gid, label, kind, open_tpl, target, needs_terminal)
-                {
-                    self.toast(e.to_string());
-                }
-                self.reload_settings();
-            }
-            PromptKind::NewHook => {
-                let Some(st) = self.settings.as_ref() else {
-                    return;
-                };
-                let gid = st.group_id;
-                if text.is_empty() {
-                    return;
-                }
-                let probe = kanban_core::Vars {
-                    card_id: 1,
-                    title: "probe".into(),
-                    slug: "probe".into(),
-                    group: "g".into(),
-                    repo: "/tmp/repo".into(),
-                    repo_name: "repo".into(),
-                    worktree: "/tmp/repo.worktrees/1-probe".into(),
-                    branch: "task/1-probe".into(),
-                };
-                if let Err(e) = kanban_core::template::render_command(&text, &probe) {
-                    self.toast(format!("钩子模板有问题：{e}"));
-                    return;
-                }
-                if let Err(e) = self.store.add_group_hook(
-                    gid,
-                    kanban_core::model::HOOK_ON_COMPLETE,
-                    &text,
-                    true,
-                ) {
-                    self.toast(e.to_string());
-                }
-                self.reload_settings();
             }
             PromptKind::AddRelation => {
                 let Some(d) = &self.detail else { return };
@@ -1659,26 +1649,19 @@ impl App {
                         };
                         self.prompt = Some(Prompt { kind, buf });
                     }
-                    SettingsFocus::Hooks => self.toggle_hook_confirm(),
+                    SettingsFocus::Hooks => self.open_entry_editor(None),
                     SettingsFocus::Buttons => {
-                        // 直接拿当前卡试跑一下这个按钮
-                        return self.run_button_from_settings();
+                        let id = self
+                            .settings
+                            .as_ref()
+                            .and_then(|s| s.buttons.get(s.sel))
+                            .map(|b| b.id);
+                        self.open_entry_editor(id);
                     }
                 }
             }
             KeyCode::Char('a') => match focus {
-                SettingsFocus::Buttons => {
-                    self.prompt = Some(Prompt {
-                        kind: PromptKind::NewButton,
-                        buf: String::new(),
-                    })
-                }
-                SettingsFocus::Hooks => {
-                    self.prompt = Some(Prompt {
-                        kind: PromptKind::NewHook,
-                        buf: String::new(),
-                    })
-                }
+                SettingsFocus::Buttons | SettingsFocus::Hooks => self.open_entry_editor(None),
                 SettingsFocus::Fields => {}
             },
             KeyCode::Char('d') => match focus {
@@ -1710,6 +1693,11 @@ impl App {
                         let _ = self.store.shift_group_button(id, delta);
                         self.reload_settings();
                     }
+                }
+            }
+            KeyCode::Char('p') => {
+                if focus == SettingsFocus::Buttons {
+                    return self.run_button_from_settings();
                 }
             }
             KeyCode::Char('T') => {
@@ -1953,6 +1941,252 @@ impl App {
         self.reload_settings();
         true
     }
+}
+
+impl App {
+    // ---------------- 按钮 / 钩子的表单编辑 ----------------
+
+    /// `editing`: Some(id) 改已有条目，None 新建。
+    fn open_entry_editor(&mut self, editing: Option<i64>) {
+        let Some(st) = &self.settings else { return };
+        let group_id = st.group_id;
+        let focus = st.focus;
+        let sel = st.sel;
+
+        let draft = match editing {
+            Some(id) => {
+                if let Some(b) = st.buttons.iter().find(|b| b.id == id) {
+                    EntryDraft {
+                        kind: DraftKind::Button,
+                        editing_id: Some(id),
+                        group_id,
+                        label: b.label.clone(),
+                        button_kind: b.kind,
+                        template: b.command().to_string(),
+                        needs_terminal: b.needs_terminal,
+                        confirm: true,
+                        field: 0,
+                        error: None,
+                    }
+                } else if let Some(h) = st.hooks.iter().find(|h| h.id == id) {
+                    EntryDraft {
+                        kind: DraftKind::Hook,
+                        editing_id: Some(id),
+                        group_id,
+                        label: String::new(),
+                        button_kind: ButtonKind::Command,
+                        template: h.run.clone(),
+                        needs_terminal: false,
+                        confirm: h.confirm,
+                        field: 0,
+                        error: None,
+                    }
+                } else {
+                    return;
+                }
+            }
+            None => EntryDraft {
+                kind: if focus == SettingsFocus::Hooks {
+                    DraftKind::Hook
+                } else {
+                    DraftKind::Button
+                },
+                editing_id: None,
+                group_id,
+                label: String::new(),
+                button_kind: ButtonKind::Workspace,
+                template: String::new(),
+                needs_terminal: false,
+                confirm: true,
+                field: 0,
+                error: None,
+            },
+        };
+        let _ = sel;
+        self.entry = Some(draft);
+        self.mode = Mode::EntryEditor;
+    }
+
+    fn on_entry_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        let Some(d) = &self.entry else {
+            self.mode = Mode::GroupSettings;
+            return None;
+        };
+        let field_count = d.fields().len();
+
+        match key.code {
+            KeyCode::Esc => {
+                self.entry = None;
+                self.mode = Mode::GroupSettings;
+            }
+            KeyCode::Char('s') => self.save_entry(),
+            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                if let Some(d) = &mut self.entry {
+                    d.field = (d.field + 1) % field_count;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(d) = &mut self.entry {
+                    d.field = (d.field + field_count - 1) % field_count;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let Some(d) = &mut self.entry else {
+                    return None;
+                };
+                let idx = d.field;
+                if d.is_text_field(idx) {
+                    let current = d.fields()[idx].1.clone();
+                    self.prompt = Some(Prompt {
+                        kind: PromptKind::EntryField,
+                        buf: current,
+                    });
+                } else if d.kind == DraftKind::Button && idx == 1 {
+                    // 类型：循环
+                    d.button_kind = next_kind(d.button_kind, 1);
+                } else {
+                    // 各种布尔开关
+                    if d.kind == DraftKind::Button {
+                        d.needs_terminal = !d.needs_terminal;
+                    } else {
+                        d.confirm = !d.confirm;
+                    }
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                if let Some(d) = &mut self.entry {
+                    if d.kind == DraftKind::Button && d.field == 1 {
+                        d.button_kind = next_kind(d.button_kind, -1);
+                    }
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                if let Some(d) = &mut self.entry {
+                    if d.kind == DraftKind::Button && d.field == 1 {
+                        d.button_kind = next_kind(d.button_kind, 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// 把草稿写进草稿字段（由 Prompt 回来时调用）。
+    fn apply_entry_field(&mut self, value: String) {
+        let Some(d) = &mut self.entry else { return };
+        match (d.kind, d.field) {
+            (DraftKind::Button, 0) => d.label = value,
+            (DraftKind::Button, 2) | (DraftKind::Hook, 0) => d.template = value,
+            _ => {}
+        }
+        d.error = None;
+    }
+
+    fn save_entry(&mut self) {
+        let Some(d) = self.entry.take() else {
+            return;
+        };
+
+        // 校验：先拿假变量试渲染，把拼错的模板挡在落库之前
+        let probe = kanban_core::Vars {
+            card_id: 1,
+            title: "probe".into(),
+            slug: "probe".into(),
+            group: "g".into(),
+            repo: "/tmp/repo".into(),
+            repo_name: "repo".into(),
+            worktree: "/tmp/repo.worktrees/1-probe".into(),
+            branch: "task/1-probe".into(),
+        };
+
+        let fail = |this: &mut Self, mut d: EntryDraft, msg: String| {
+            d.error = Some(msg.clone());
+            this.entry = Some(d);
+            this.toast(msg);
+        };
+
+        if d.template.trim().is_empty() {
+            return fail(self, d, "模板不能为空".into());
+        }
+        if d.kind == DraftKind::Button && d.label.trim().is_empty() {
+            return fail(self, d, "标签不能为空".into());
+        }
+
+        let rendered = if d.kind == DraftKind::Button && d.button_kind == ButtonKind::Link {
+            kanban_core::template::render_display(&d.template, &probe)
+        } else {
+            kanban_core::template::render_command(&d.template, &probe)
+        };
+        if let Err(e) = rendered {
+            return fail(self, d, format!("模板有问题：{e}"));
+        }
+
+        let result = match d.kind {
+            DraftKind::Button => {
+                let (open_tpl, target) = if d.button_kind == ButtonKind::Workspace {
+                    (d.template.as_str(), "")
+                } else {
+                    ("", d.template.as_str())
+                };
+                let needs_terminal = d.button_kind == ButtonKind::Command
+                    && (d.needs_terminal || kanban_core::exec::infer_needs_terminal(&d.template));
+                match d.editing_id {
+                    Some(id) => self.store.update_group_button(
+                        id,
+                        &d.label,
+                        d.button_kind,
+                        open_tpl,
+                        target,
+                        needs_terminal,
+                    ),
+                    None => self
+                        .store
+                        .add_group_button(
+                            d.group_id,
+                            &d.label,
+                            d.button_kind,
+                            open_tpl,
+                            target,
+                            needs_terminal,
+                        )
+                        .map(|_| ()),
+                }
+            }
+            DraftKind::Hook => match d.editing_id {
+                Some(id) => self.store.update_group_hook(id, &d.template, d.confirm),
+                None => self
+                    .store
+                    .add_group_hook(
+                        d.group_id,
+                        kanban_core::model::HOOK_ON_COMPLETE,
+                        &d.template,
+                        d.confirm,
+                    )
+                    .map(|_| ()),
+            },
+        };
+
+        match result {
+            Ok(()) => {
+                self.mode = Mode::GroupSettings;
+                self.reload_settings();
+                self.toast(if d.editing_id.is_some() {
+                    "已保存"
+                } else {
+                    "已添加"
+                });
+            }
+            Err(e) => fail(self, d, e.to_string()),
+        }
+    }
+}
+
+fn next_kind(k: ButtonKind, delta: i32) -> ButtonKind {
+    let all = [ButtonKind::Workspace, ButtonKind::Command, ButtonKind::Link];
+    let idx = all.iter().position(|x| *x == k).unwrap_or(0) as i32;
+    let next = (idx + delta).rem_euclid(all.len() as i32) as usize;
+    all[next]
 }
 
 #[cfg(test)]

@@ -73,6 +73,10 @@ fn parse_keys(spec: &str) -> Vec<ratatui::crossterm::event::KeyEvent> {
     let mut chars = spec.chars();
     while let Some(c) = chars.next() {
         let code = match c {
+            // 真实控制字符（直接传 $'g\ta' 时就是这些）
+            '\t' => KeyCode::Tab,
+            '\r' | '\n' => KeyCode::Enter,
+            '\u{1b}' => KeyCode::Esc,
             '\\' => match chars.next() {
                 Some('r') | Some('n') => KeyCode::Enter,
                 Some('t') => KeyCode::Tab,

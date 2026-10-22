@@ -27,6 +27,10 @@ pub fn render(app: &mut App, f: &mut Frame) {
         Mode::Archive => render_archive(app, f, chunks[1]),
         Mode::GroupSettings => render_settings(app, f, chunks[1]),
         Mode::Workspaces => render_workspaces(app, f, chunks[1]),
+        Mode::EntryEditor => {
+            render_settings(app, f, chunks[1]);
+            render_entry_editor(app, f, chunks[1]);
+        }
     }
 
     render_status(app, f, chunks[2]);
@@ -859,7 +863,7 @@ fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
     // ---------- 按钮 ----------
     let btn_focused = snapshot.focus == SettingsFocus::Buttons;
     let btn_title = if btn_focused {
-        " 按钮 · a 新增 Enter 试跑 d 删除 J/K 排序 T 终端 ".to_string()
+        " 按钮 · a 新增 Enter 编辑 p 试跑 d 删除 J/K 排序 T 终端 ".to_string()
     } else {
         " 按钮 ".to_string()
     };
@@ -903,7 +907,7 @@ fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
     // ---------- 完成钩子 ----------
     let hook_focused = snapshot.focus == SettingsFocus::Hooks;
     let hook_title = if hook_focused {
-        " 完成钩子 · a 新增 d 删除 Enter/T 切换是否提示 ".to_string()
+        " 完成钩子 · a 新增 Enter 编辑 d 删除 T 切换是否提示 ".to_string()
     } else {
         " 完成钩子 ".to_string()
     };
@@ -943,6 +947,103 @@ fn render_settings(app: &mut App, f: &mut Frame, area: Rect) {
             ),
         ]);
         paint_row(f, body.x, y, body.width, row_style, line);
+    }
+}
+
+fn render_entry_editor(app: &mut App, f: &mut Frame, area: Rect) {
+    let Some(d) = &app.entry else { return };
+    let fields = d.fields();
+    let field = d.field;
+    let error = d.error.clone();
+    let kind = d.kind;
+    let editing = d.editing_id.is_some();
+
+    let title = match kind {
+        crate::app::DraftKind::Button => {
+            if editing {
+                " 编辑按钮 "
+            } else {
+                " 新建按钮 "
+            }
+        }
+        crate::app::DraftKind::Hook => {
+            if editing {
+                " 编辑完成钩子 "
+            } else {
+                " 新建完成钩子 "
+            }
+        }
+    };
+
+    let w = area.width.saturating_sub(6).min(84);
+    let h = (fields.len() as u16 + 6).min(area.height);
+    let rect = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    );
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(Span::styled(
+            title,
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let rows = Layout::vertical([
+        Constraint::Length(fields.len() as u16),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+
+    for (i, (label, value)) in fields.iter().enumerate() {
+        let y = rows[0].y + i as u16;
+        let focused = i == field;
+        let row_style = if focused {
+            Style::new().bg(SEL_BG)
+        } else {
+            Style::new()
+        };
+        let shown = if value.trim().is_empty() {
+            Span::styled("（空，按 Enter 填）", Style::new().fg(DIM))
+        } else {
+            Span::styled(value.clone(), Style::new().fg(Color::White))
+        };
+        let hint = if focused && !d.is_text_field_public(i) {
+            " ←/→ 切换"
+        } else {
+            ""
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {}  ", pad(label, 10)),
+                Style::new().fg(if focused { Color::Cyan } else { DIM }),
+            ),
+            shown,
+            Span::styled(hint.to_string(), Style::new().fg(DIM)),
+        ]);
+        paint_row(f, rows[0].x, y, rows[0].width, row_style, line);
+    }
+
+    if let Some(err) = error {
+        f.render_widget(
+            Paragraph::new(format!(" ⚠ {err}")).style(Style::new().fg(Color::Red)),
+            rows[1],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(
+                " s 保存 · Esc 取消 · 模板可用 {card_id} {slug} {repo} {worktree} {branch}",
+            )
+            .style(Style::new().fg(DIM)),
+            rows[1],
+        );
     }
 }
 
@@ -1146,10 +1247,13 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
         Mode::Detail => "Tab 切焦点 · space 勾选/执行 · 1-9 跑动作 · t 子任务 · c/y 加动作 · e 正文 · Esc 返回".to_string(),
         Mode::Archive => "j/k 选择 · u 恢复 · x 彻底删除 · v 返回".to_string(),
         Mode::GroupSettings => {
-            "Tab 切分区 · j/k 选 · Enter 编辑/试跑 · a 新增 · d 删除 · J/K 排序 · T 切换 · Esc 返回"
+            "Tab 切分区 · j/k 选 · Enter 编辑 · p 试跑 · a 新增 · d 删除 · J/K 排序 · T 切换 · Esc 返回"
                 .to_string()
         }
         Mode::Workspaces => "j/k 选择 · Enter 打开 · d 删除工作区 · W/Esc 返回".to_string(),
+        Mode::EntryEditor => {
+            "j/k 选字段 · Enter 编辑/切换 · ←/→ 切类型 · s 保存 · Esc 取消".to_string()
+        }
     };
     f.render_widget(
         Paragraph::new(hint)
