@@ -226,21 +226,58 @@ fn run_group_button(
     Ok(())
 }
 
+/// 删除工作区：**必须先关掉 cmux 里的 workspace**。
+///
+/// cmux 关闭 workspace 时会自己 `git worktree remove` 对应的 worktree；
+/// 反过来先删目录，就会在 cmux 里留下一个指向已删目录的窗口。
 fn remove_workspace(app: &mut app::App, card_id: i64) {
     let Ok(Some(ws)) = app.store.workspace_for_card(card_id) else {
         app.toast("这张卡没有工作区");
         return;
     };
-    if kanban_core::git::is_dirty(&ws.path) {
-        app.toast("工作区里有未提交的改动，先处理再删");
-        return;
-    }
-    match kanban_core::git::worktree_remove(&ws.repo_path, &ws.path, false) {
-        Ok(()) => {
-            let _ = app.store.delete_workspace(card_id);
-            app.toast("工作区已删除");
-        }
-        Err(e) => app.toast(e.to_string()),
+
+    let script = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("kanban-close-ws")))
+        .filter(|p| p.exists())
+        .or_else(|| {
+            // 开发时脚本不在 target/debug 旁边，回退到仓库里的路径
+            let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/kanban-close-ws");
+            if repo.exists() {
+                Some(repo)
+            } else {
+                None
+            }
+        });
+
+    match script {
+        Some(path) => match std::process::Command::new(&path)
+            .arg("--repo")
+            .arg(&ws.repo_path)
+            .arg("--worktree")
+            .arg(&ws.path)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let _ = app.store.delete_workspace(card_id);
+                app.toast("已关闭 workspace 并删除 worktree");
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                // 退出码 3 = worktree 有未提交改动（窗口已关、目录保留）
+                // 退出码 4 = 还有窗口关不掉，为避免死窗口没有删目录
+                let msg = if stderr.is_empty() {
+                    "删除失败".to_string()
+                } else {
+                    stderr
+                };
+                app.toast(msg);
+            }
+            Err(e) => app.toast(format!("调用 kanban-close-ws 失败: {e}")),
+        },
+        // 没有脚本就什么都不做：先删目录会在 cmux 里留下指向已删目录的死窗口
+        None => app.toast("找不到 scripts/kanban-close-ws，未删除（避免留下死窗口）"),
     }
     app.refresh();
 }

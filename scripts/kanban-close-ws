@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# kanban-close-ws — 关掉某个 worktree 对应的 cmux workspace，并顺手删掉 worktree。
+#
+# 关键在于顺序：cmux 关闭 workspace 时会自己 `git worktree remove` 它对应的
+# worktree（干净的会删掉、脏的会留下），所以必须**先关 workspace 再补删**，
+# 反过来会留下一个指向已删目录的窗口。
+#
+# 用法：
+#   kanban-close-ws --repo <仓库路径> --worktree <worktree 路径> [--force]
+#
+# 不给 --force 时：worktree 有未提交改动 → 只关 workspace，保留目录并报错退出 3。
+
+set -euo pipefail
+
+REPO=""; WORKTREE=""; FORCE=0
+
+die() { printf 'kanban-close-ws: %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) REPO="${2-}"; shift 2 ;;
+    --worktree) WORKTREE="${2-}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "未知参数 $1" ;;
+  esac
+done
+
+[ -n "$REPO" ] || die "缺少 --repo"
+[ -n "$WORKTREE" ] || die "缺少 --worktree"
+
+# macOS 上 /tmp 是 /private/tmp 的符号链接，而 cmux 报的 current_directory
+# 有时是解析后的、有时是原始写法，两边都要归一化才比得上。
+norm() {
+  local p="${1%/}"
+  while :; do
+    case "$p" in
+      /private/tmp*) p="/tmp${p#/private/tmp}" ;;
+      /private/var*) p="/var${p#/private/var}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$p"
+}
+
+abs() {
+  local d="$1" resolved
+  resolved=$( cd "$d" 2>/dev/null && pwd -P ) || resolved="$d"
+  norm "$resolved"
+}
+
+TARGET=$(abs "$WORKTREE")
+
+# 列出 cwd 在这个 worktree 下的所有 workspace（含子目录）
+ws_refs_at() {
+  cmux workspace list --json 2>/dev/null \
+    | jq -r '.workspaces[] | [.ref, (.current_directory // "")] | @tsv' 2>/dev/null \
+    | while IFS=$'\t' read -r ref dir; do
+        d=$(abs "$dir")
+        [ -n "$d" ] || continue
+        if [ "$d" = "$TARGET" ] || case "$d" in "$TARGET"/*) true ;; *) false ;; esac; then
+          printf '%s\n' "$ref"
+        fi
+      done
+}
+
+closed=0
+if command -v cmux >/dev/null 2>&1; then
+  # 刚建出来的 workspace 可能还没出现在 list 里，给几次机会
+  refs=""
+  for _ in 1 2 3 4; do
+    refs=$(ws_refs_at)
+    [ -n "$refs" ] && break
+    sleep 0.3
+  done
+
+  for ref in $refs; do
+    [ -n "$ref" ] || continue
+    if cmux workspace close "$ref" --force >/dev/null 2>&1; then
+      printf '已关闭 workspace %s\n' "$ref"
+      closed=$((closed + 1))
+    else
+      printf 'kanban-close-ws: 关不掉 workspace %s\n' "$ref" >&2
+    fi
+  done
+
+  # 还有窗口指着这个目录就不删，免得留下一个指向已删目录的死窗口。
+  # cmux 关闭是异步的，list 会晚一拍，所以多等几次再判断。
+  left=$refs
+  for _ in 1 2 3 4 5 6; do
+    left=$(ws_refs_at)
+    [ -z "$left" ] && break
+    sleep 0.3
+  done
+  if [ -n "$left" ]; then
+    printf 'kanban-close-ws: 仍有 workspace 打开着 %s（%s），先不删 worktree\n' \
+      "$TARGET" "$(printf '%s' "$left" | tr '\n' ' ')" >&2
+    exit 4
+  fi
+fi
+
+# cmux 关窗口时通常会顺手把 worktree 删掉；没删掉（脏的、或压根没开窗口）就自己来
+if [ -d "$TARGET" ]; then
+  if [ "$FORCE" -eq 1 ]; then
+    git -C "$REPO" worktree remove --force "$TARGET" 2>&1 | head -2 || true
+  else
+    if ! git -C "$REPO" worktree remove "$TARGET" 2>/dev/null; then
+      printf 'kanban-close-ws: worktree 有未提交改动，已保留 %s（要强制删除加 --force）\n' "$TARGET" >&2
+      exit 3
+    fi
+  fi
+  printf '已删除 worktree %s\n' "$TARGET"
+fi
+
+[ "$closed" -gt 0 ] && printf '完成（关闭 %d 个 workspace）\n' "$closed" || printf '完成\n'

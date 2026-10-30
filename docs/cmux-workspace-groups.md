@@ -74,3 +74,65 @@ kanban-open-ws --repo {repo} --worktree {worktree} --branch {branch} --title {ti
 2. **看板侧记录 cmux 分组**：把 `workspace_group:N` 存进 `card_workspaces`，
    这样「工作区总览」能按仓库分组展示，也能在卡片上显示它属于哪个组。
 3. **脚本的 jq 依赖**：目前用 `jq` 解析 `--json`。若不想依赖，可换成 `python3 -c`（机器上都有）。
+
+---
+
+# 删除工作区（同时删掉 worktree）
+
+## cmux 的隐藏行为（已实测）
+
+**`cmux workspace close` 会顺手 `git worktree remove` 掉该 workspace 对应的 worktree。**
+
+| 场景 | 结果 |
+|---|---|
+| worktree 干净 → `cmux workspace close <ref> --force` | workspace 关闭，**worktree 目录与 git 注册一起消失** |
+| worktree 有未提交改动 → 同上 | workspace 关闭，worktree **保留**（git 拒绝删除） |
+
+所以在 cmux 里"删工作区"和"删 worktree"是同一件事，不需要额外命令。
+`cmux-wt` 的源码里也留了注释说明这点"help 里看不到，容易误以为数据丢了"。
+
+反过来的坑更值得记：**想关窗口但保留 worktree，必须放一个未跟踪文件**（`cmux-wt` 用的是
+`.cmux-wt-keep`），因为 git 只有在"有未跟踪文件"时才会拒绝删除。
+
+## 三种正确做法
+
+| 目的 | 做法 |
+|---|---|
+| 两个都删（干净） | `cmux workspace close <ref> --force` |
+| 两个都删（有未提交改动） | 先 close，再 `git -C <repo> worktree remove --force <path>` |
+| 只关窗口、保留目录 | 先在目录里 `touch .cmux-wt-keep`，再 close，然后删掉这个标记文件 |
+
+**顺序不能反**：先 `git worktree remove` 会让 cmux 里留下一个指向已删目录的死窗口。
+
+## 看板里的实现
+
+`scripts/kanban-close-ws`（工作区总览里按 `d` 会调它）：
+
+```
+kanban-close-ws --repo {repo} --worktree {worktree} [--force]
+```
+
+1. 按 **归一化后的路径** 找出 cwd 在这个 worktree 下的所有 workspace（含子目录），逐个 close
+2. 等它们从 `workspace list` 里消失（cmux 关闭是异步的）
+3. 仍有关不掉的窗口 → **不删目录**，退出码 4，避免死窗口
+4. 目录还在（脏的、或本来没开窗口）→ `git worktree remove`；脏且没加 `--force` → 退出码 3，保留目录
+5. 成功 → 看板删除 `card_workspaces` 记录，提示"已关闭 workspace 并删除 worktree"
+
+### 踩过的两个坑
+
+1. **路径匹配**：macOS 上 `/tmp` 是 `/private/tmp` 的符号链接，cmux 报的 `current_directory`
+   有时解析、有时不解析。脚本对两边都做 `/private/* → /*` 归一化再比较，否则匹配不上、
+   窗口没关却把目录删了（会留下死窗口）。
+2. **异步延迟**：刚创建的 workspace 可能还不在 `workspace list` 里；close 之后也不会立刻消失。
+   两个方向都要轮询几百毫秒，否则"关不掉"和"已关掉"都会误判。
+
+## 验收（实测）
+
+| 场景 | 结果 |
+|---|---|
+| 干净 worktree + 开着窗口 | 窗口关闭、目录删除、无残留 |
+| 脏 worktree + 开着窗口，不加 `--force` | 窗口关闭、目录保留、退出码 3 |
+| 脏 worktree + `--force` | 两者都删 |
+| 没开窗口的 worktree | 直接删目录 |
+| 目录已不存在 | 幂等，退出码 0 |
+| 看板里按 `d`（端到端） | worktree 消失、cmux 窗口消失、DB 记录清除、提示正确 |
