@@ -109,21 +109,32 @@ tail -50 app.log | grep ERROR
 命令     git -C {repo} worktree remove {worktree}
 ```
 
-### 归到 cmux 的同一个分组
+### 归到 cmux 的同一个分组（自动）
 
-默认 `cmux {worktree}` 会在侧边栏新加一条独立 workspace，一个仓库干十件事就是十条。想让同一仓库的任务收在一个可折叠分组里，用仓库自带的脚本：
+如果工作区按钮的打开命令就是 `cmux {worktree}`（或 `cmux open {worktree}`），看板会**自动**补上 `--group`：
+
+1. 按 `idempotency_key = repo:<仓库真实路径>` 找这个仓库的 cmux 分组，找不到再按仓库目录名找
+2. 都没有就建一个（名字 = 仓库目录名，带幂等键，并发不会建出两个）
+3. 把 `--group <ref>` 追加到你的命令后面
+4. 打开成功后，把 cmux 自动生成的空锚点 workspace 换成真实的那一个并关掉空条目
+
+所以你只要写：
+
+```
+cmux {worktree}
+```
+
+就够，同仓库的所有任务会收在一个可折叠分组下面。换成 `code {worktree}` / `codex {worktree}` 时看板**完全不干预**（只在命令是 cmux 且没有 `--group` 时才动手）。
+
+需要更复杂的流程（自定义布局、多个 pane、复制 `.env`）时，才用脚本：
 
 ```
 /Users/pikaka/work/task-kanban/scripts/kanban-open-ws --repo {repo} --worktree {worktree} --branch {branch} --title {title_arg}
 ```
 
-它会：建/复用 worktree → 按仓库名找到（或建出）cmux 分组 → 开 workspace 并放进组。
-同一个仓库的所有任务自然落在一个分组下面，重复点击只会选中已有 workspace，不会重复创建。
+> `{title_arg}` 会被转义成**一个参数**，标题里有空格、分号也不会被 shell 解释；`{title}` 仍然禁止出现在命令里。
 
 细节与实测记录见 [docs/cmux-workspace-groups.md](docs/cmux-workspace-groups.md)。
-
-> 这里用 `{title_arg}` 而不是 `{title}`：前者会被转义成**一个参数**，
-> 标题里有空格、分号也不会被 shell 解释；后者仍然禁止出现在命令里。
 
 换工具只改这一行——代码里没有任何 `cmux` / `codex` / `code` 字样。`{title}` 只能用于显示，拼进命令会直接报错（要引用标题请用 `{slug}`）。
 

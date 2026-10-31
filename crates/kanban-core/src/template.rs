@@ -68,6 +68,7 @@ impl Vars {
             .repo_path
             .as_deref()
             .map(expand_tilde)
+            .map(|p| normalize_path(&p))
             .unwrap_or_default();
         let repo_name = if repo.is_empty() {
             String::new()
@@ -106,7 +107,7 @@ impl Vars {
         base.worktree = if root.is_empty() {
             String::new()
         } else {
-            format!("{root}/{}-{}", card.id, slug)
+            normalize_path(&format!("{root}/{}-{}", card.id, slug))
         };
         base
     }
@@ -228,6 +229,35 @@ pub fn slugify(title: &str) -> String {
     }
 }
 
+/// 把 `a/b/../c` 这种路径解析成 `a/c`，并去掉结尾斜杠。
+///
+/// 不改动文件系统、也不解析符号链接（`/tmp` vs `/private/tmp` 交给调用方）。
+pub fn normalize_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if matches!(parts.last(), Some(&last) if last != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
+    }
+}
+
 /// `~/x` → `/Users/you/x`
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -302,6 +332,8 @@ mod tests {
         assert_eq!(slugify("重构 store 层"), "store");
         assert_eq!(slugify("全部中文"), "task");
         assert_eq!(slugify("---"), "task");
+        // 纯中文标题没有 ASCII 字母，slug 会退化成 task；卡 id 保证目录不撞
+        assert_eq!(slugify("语音"), "task");
     }
 
     #[test]
@@ -329,7 +361,8 @@ mod tests {
         assert_eq!(v.repo, "/w/app");
         assert_eq!(v.repo_name, "app");
         assert_eq!(v.branch, "task/12-nightly-ci");
-        assert_eq!(v.worktree, "/w/app/../app.worktrees/12-nightly-ci");
+        // 路径里的 .. 会被解析掉，便于和 cmux 报的 realpath 对上
+        assert_eq!(v.worktree, "/w/app.worktrees/12-nightly-ci");
     }
 }
 
@@ -369,5 +402,23 @@ mod title_arg_tests {
             render_display("{title}", &vars()).unwrap(),
             "修 bug; rm -rf /"
         );
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::normalize_path;
+
+    #[test]
+    fn resolves_dot_dot_segments() {
+        assert_eq!(
+            normalize_path("/Users/me/app/../app.worktrees/1-x"),
+            "/Users/me/app.worktrees/1-x"
+        );
+        assert_eq!(normalize_path("/a/b/c/../../d"), "/a/d");
+        assert_eq!(normalize_path("/a/./b/"), "/a/b");
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path("rel/../x"), "x");
+        assert_eq!(normalize_path("../x"), "../x");
     }
 }

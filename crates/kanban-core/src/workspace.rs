@@ -111,6 +111,190 @@ pub fn ensure_workspace(store: &Store, group: &Group, card: &Card) -> Result<Ens
     })
 }
 
+/// 确保这个仓库在 cmux 里有一个分组，返回它的 ref。
+///
+/// 匹配顺序：`idempotency_key`（`repo:<真实路径>`，最可靠）→ 分组名 == 仓库目录名。
+/// 都没有就建一个。建组时带 `--idempotency-key`，并发/重试不会建出两个。
+pub fn ensure_cmux_group(repo_path: &str) -> Option<String> {
+    let repo = std::path::Path::new(repo_path);
+    let name = repo.file_name()?.to_string_lossy().to_string();
+    let real = std::fs::canonicalize(repo)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| repo_path.to_string());
+    let key = format!("repo:{real}");
+
+    if let Some(groups) = cmux_groups() {
+        for g in &groups {
+            if g.idempotency_key.as_deref() == Some(key.as_str()) {
+                return Some(g.reference.clone());
+            }
+        }
+        for g in &groups {
+            if g.name == name {
+                return Some(g.reference.clone());
+            }
+        }
+    }
+
+    let out = std::process::Command::new("cmux")
+        .args([
+            "workspace",
+            "group",
+            "create",
+            "--name",
+            &name,
+            "--idempotency-key",
+            &key,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find(|t| t.starts_with("workspace_group:"))
+        .map(|t| t.to_string())
+}
+
+struct CmuxGroup {
+    reference: String,
+    name: String,
+    idempotency_key: Option<String>,
+}
+
+/// 极简 JSON 提取：只取 `groups[]` 里每项的 ref / name / idempotency_key。
+///
+/// 不引 serde——这里只要三个字段，cmux 的输出格式也稳定。
+fn cmux_groups() -> Option<Vec<CmuxGroup>> {
+    let out = std::process::Command::new("cmux")
+        .args(["workspace", "group", "list", "--json"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let mut groups = Vec::new();
+    for chunk in text.split('{').skip(1) {
+        let Some(reference) = json_field(chunk, "ref") else {
+            continue;
+        };
+        groups.push(CmuxGroup {
+            reference,
+            name: json_field(chunk, "name").unwrap_or_default(),
+            idempotency_key: json_field(chunk, "idempotency_key"),
+        });
+    }
+    Some(groups)
+}
+
+fn json_field(chunk: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let pos = chunk.find(&needle)?;
+    let rest = &chunk[pos + needle.len()..];
+    let rest = rest.trim_start_matches([':', ' ', '\n', '\t']);
+    let stripped = rest.strip_prefix('"')?;
+    let end = stripped.find('"')?;
+    let value = &stripped[..end];
+    if value == "null" {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// 若打开命令是 cmux 的「开目录」形式，补上 `--group`，让同一仓库的工作区落进同一个分组。
+///
+/// 只在命令里出现 `cmux` 且没有 `--group` 时动手；`code` / `codex` / 自定义脚本一律不动，
+/// 保持「换工具只改配置」这条约定。
+pub fn group_aware_open(open_cmd: &str, repo_path: &str) -> (String, Option<String>) {
+    let trimmed = open_cmd.trim();
+    let mut parts = trimmed.split_whitespace();
+    let bin = parts.next().unwrap_or("");
+    if bin.rsplit('/').next() != Some("cmux") {
+        return (open_cmd.to_string(), None);
+    }
+    if trimmed.contains("--group") {
+        return (open_cmd.to_string(), None);
+    }
+    let rest: Vec<&str> = parts.collect();
+    let plain_path = match rest.as_slice() {
+        [] => true,
+        [only] => !only.starts_with('-'),
+        ["open", only] => !only.starts_with('-'),
+        _ => false,
+    };
+    if !plain_path {
+        return (open_cmd.to_string(), None);
+    }
+
+    match ensure_cmux_group(repo_path) {
+        Some(group) => (format!("{trimmed} --group {group}"), Some(group)),
+        None => (open_cmd.to_string(), None),
+    }
+}
+
+/// cmux 建组会生成一个空锚点 workspace（落在调用者当前目录、名字就是组名）。
+/// 第一个真实成员进来后把锚点换掉，并关掉那个空条目。
+pub fn adopt_cmux_anchor(group: &str, worktree: &str) {
+    let real = std::fs::canonicalize(worktree)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| worktree.to_string());
+
+    let Ok(out) = std::process::Command::new("cmux")
+        .args(["workspace", "list", "--json"])
+        .output()
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let mut ws_ref = None;
+    for chunk in text.split('{').skip(1) {
+        let cwd = json_field(chunk, "current_directory").unwrap_or_default();
+        if cwd == real || cwd == worktree {
+            ws_ref = json_field(chunk, "ref");
+            break;
+        }
+    }
+    let Some(ws) = ws_ref else { return };
+
+    let Ok(out) = std::process::Command::new("cmux")
+        .args(["workspace", "group", "list", "--json"])
+        .output()
+    else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    for chunk in text.split('{').skip(1) {
+        if json_field(chunk, "ref").as_deref() != Some(group) {
+            continue;
+        }
+        if !chunk.contains("\"anchor_workspace_is_generated\" : true") {
+            return;
+        }
+        let old = json_field(chunk, "anchor_workspace_ref");
+        let _ = std::process::Command::new("cmux")
+            .args([
+                "workspace-group",
+                "set-anchor",
+                "--group",
+                group,
+                "--workspace",
+                &ws,
+            ])
+            .output();
+        if let Some(old) = old {
+            if old != ws {
+                let _ = std::process::Command::new("cmux")
+                    .args(["workspace", "close", &old])
+                    .output();
+            }
+        }
+        return;
+    }
+}
+
 /// 点一个分组按钮：按类型分发。
 pub fn run_group_button(
     store: &Store,
@@ -129,7 +313,13 @@ pub fn run_group_button(
             vars.branch = ensured.workspace.branch.clone();
             let cmd = template::render_command(&button.open_template, &vars)
                 .map_err(|e| StoreError::InvalidConfig(format!("按钮「{}」：{e}", button.label)))?;
-            exec::run_shell(store, "button", None, &cmd, button.needs_terminal, echo)
+            let (cmd, group) = group_aware_open(&cmd, &vars.repo);
+            let outcome = exec::run_shell(store, "button", None, &cmd, button.needs_terminal, echo)?;
+            // cmux 建组时会留一个空锚点，把它换成刚开的真实 workspace
+            if let (Some(group), true) = (group, matches!(outcome, Outcome::Finished { exit_code: Some(0), .. })) {
+                adopt_cmux_anchor(&group, &ensured.workspace.path);
+            }
+            Ok(outcome)
         }
         ButtonKind::Command => {
             let cmd = template::render_command(&button.target, &vars)

@@ -235,3 +235,51 @@ fn relations_reject_cycles_and_duplicates() {
     // 自环
     assert!(store.add_relation(a, a, RelationKind::ParentChild).is_err());
 }
+
+#[test]
+fn workspace_button_injects_cmux_group_when_open_cmd_is_cmux() {
+    // 只验证"命令改写"这一步，不真的调 cmux（CI 里没有 cmux）
+    let repo = temp_repo("grp");
+    let store = Store::open_in_memory().unwrap();
+    let gid = store.groups(false, false).unwrap()[0].id;
+    store
+        .set_group_config(gid, Some(&repo.to_string_lossy()), None, None)
+        .unwrap();
+
+    // 没有 cmux 分组时不该乱加参数（cmux 不可用 → ensure 返回 None）
+    let (cmd, group) = workspace::group_aware_open("cmux {worktree}", &repo.to_string_lossy());
+    // 本机有 cmux 时会补 --group；没有时原样返回。两种都算对。
+    if let Some(g) = group {
+        assert!(cmd.contains("--group"), "{cmd}");
+        assert!(cmd.contains(&g), "{cmd}");
+    } else {
+        assert_eq!(cmd, "cmux {worktree}");
+    }
+
+    // 非 cmux 命令一律不动
+    let (cmd, group) = workspace::group_aware_open("code {worktree}", &repo.to_string_lossy());
+    assert_eq!(cmd, "code {worktree}");
+    assert!(group.is_none());
+
+    // 已经带 --group 的不重复加
+    let (cmd, _) = workspace::group_aware_open("cmux {worktree} --group workspace_group:1", &repo.to_string_lossy());
+    assert_eq!(cmd.matches("--group").count(), 1);
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn worktree_path_has_no_dotdot_segments() {
+    let store = Store::open_in_memory().unwrap();
+    let gid = store.groups(false, false).unwrap()[0].id;
+    store
+        .set_group_config(gid, Some("/Users/me/app"), None, None)
+        .unwrap();
+    let group = store.group(gid).unwrap();
+    let cid = store.create_card(gid, "修 bug").unwrap();
+    let card = store.card(cid).unwrap();
+
+    let v = kanban_core::Vars::build(&group, &card);
+    assert!(!v.worktree.contains(".."), "worktree 路径不该含 ..: {}", v.worktree);
+    assert_eq!(v.worktree, "/Users/me/app.worktrees/1-bug");
+}

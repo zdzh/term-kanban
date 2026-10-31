@@ -40,18 +40,31 @@ kanban-open-ws --repo {repo} --worktree {worktree} --branch {branch} --title {ti
    - 没找到 → `workspace create --group <g> --group-placement end`
 4. `adopt_anchor()`：若组锚点是自动生成的，换成刚建的真实 workspace，并关掉那个空锚点
 
-## 接到看板里
+## 接到看板里（两种方式）
 
-在分组设置（`g`）里把「工作区」按钮的打开命令换成这个脚本：
+### 方式一：看板自动补分组（推荐）
+
+打开命令保持 `cmux {worktree}`，看板在调用前会自动：
+
+1. 按 `idempotency_key = repo:<真实路径>` 找分组，找不到再按仓库目录名找
+2. 都没有就 `workspace group create --name <仓库名> --idempotency-key repo:<真实路径>`
+3. 把 `--group <ref>` 追加到命令末尾
+4. 打开成功后 `adopt_cmux_anchor()`：若锚点是自动生成的，换成刚开的真实 workspace 并关掉空锚点
+
+**只在命令以 `cmux` 开头、是"开目录"形式（`cmux <路径>` / `cmux open <路径>`）且不含 `--group` 时才动手。**
+`code` / `codex` / 自定义脚本一律不干预。
+
+### 方式二：用脚本（需要更复杂的流程时）
 
 ```
 /Users/pikaka/work/task-kanban/scripts/kanban-open-ws \
-  --repo {repo} --worktree {worktree} --branch {branch} --title {title}
+  --repo {repo} --worktree {worktree} --branch {branch} --title {title_arg}
 ```
 
-> `{title}` 在这里是**参数值**而不是拼进 shell 的裸字符串——脚本自己按参数解析，
-> 所以标题里有空格、引号都不会出问题。看板的模板层仍然禁止 `{title}` 出现在命令里，
-> 这一条需要放宽成"作为独立参数传入"（见下文待办）。
+脚本额外做的事：复用已有 workspace（按 `current_directory` 精确匹配）、给 workspace 设置标题、`--group-placement end`。
+
+> 注意用 `{title_arg}` 而不是 `{title}`：前者会被转义成**一个参数**，标题里有空格、
+> 分号也不会被 shell 解释；后者仍然禁止出现在命令里。
 
 想换 codex / vscode 仍然只是改这一行里的命令，脚本本身与工具无关。
 
@@ -65,15 +78,14 @@ kanban-open-ws --repo {repo} --worktree {worktree} --branch {branch} --title {ti
 | 三个并发调用 | 只产生 1 个组（`--idempotency-key` 生效），成员数正确 |
 | worktree 已存在但 workspace 没开 | 直接开，不重建 worktree |
 
-## 待办
+## 已知限制
 
-1. **模板层放宽 `{title}` 的用法**：目前 `render_command` 遇到 `{title}` 直接报错。
-   需要区分"拼进 shell 字符串"（危险，禁止）与"作为独立参数传给脚本"（安全）。
-   最小改法：新增 `{title_arg}` 变量，渲染成已做单引号转义的形式，允许出现在命令里；
-   `{title}` 仍保持禁止，避免误用。
-2. **看板侧记录 cmux 分组**：把 `workspace_group:N` 存进 `card_workspaces`，
-   这样「工作区总览」能按仓库分组展示，也能在卡片上显示它属于哪个组。
-3. **脚本的 jq 依赖**：目前用 `jq` 解析 `--json`。若不想依赖，可换成 `python3 -c`（机器上都有）。
+1. **看板侧没有记录 cmux 分组**：`workspace_group:N` 没存进 `card_workspaces`，
+   所以「工作区总览」目前不按仓库分组展示，卡片上也不显示所属组。
+2. **脚本依赖 `jq`**：`kanban-open-ws` / `kanban-close-ws` 用 `jq` 解析 `--json`；
+   看板内部的 `ensure_cmux_group` 自己解析，不依赖 jq。
+3. **纯中文标题的 slug 会退化成 `task`**：`{slug}` 只保留 ASCII 字母数字，
+   所以「语音」→ `task`。目录名靠 `{card_id}` 前缀保证唯一（`8-task`）。
 
 ---
 
