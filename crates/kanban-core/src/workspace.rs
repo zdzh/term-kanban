@@ -82,9 +82,16 @@ pub fn ensure_workspace(store: &Store, group: &Group, card: &Card) -> Result<Ens
         )));
     }
 
-    // 已经登记过且目录还在 → 复用
-    if let Some(ws) = store.workspace_for_card(card.id)? {
+    // 已经登记过且目录还在 → 复用。
+    // 旧版本可能记下了带 `..` 的路径，这里顺手修正，否则后面所有命令都会用脏路径
+    // （cmux 报的 current_directory 是 realpath，对不上就匹配不到、也归不了组）。
+    if let Some(mut ws) = store.workspace_for_card(card.id)? {
         if Path::new(&ws.path).is_dir() {
+            let clean = template::normalize_path(&ws.path);
+            if clean != ws.path {
+                ws.path = clean;
+                store.save_workspace(&ws)?;
+            }
             store.touch_workspace(card.id)?;
             return Ok(EnsureOutcome {
                 workspace: ws,

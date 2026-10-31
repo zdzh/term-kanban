@@ -283,3 +283,46 @@ fn worktree_path_has_no_dotdot_segments() {
     assert!(!v.worktree.contains(".."), "worktree 路径不该含 ..: {}", v.worktree);
     assert_eq!(v.worktree, "/Users/me/app.worktrees/1-bug");
 }
+
+#[test]
+fn stale_workspace_path_is_cleaned_on_reuse() {
+    let repo = temp_repo("stale");
+    let store = Store::open_in_memory().unwrap();
+    let gid = store.groups(false, false).unwrap()[0].id;
+    store
+        .set_group_config(gid, Some(&repo.to_string_lossy()), None, None)
+        .unwrap();
+    let group = store.group(gid).unwrap();
+    let cid = store.create_card(gid, "x").unwrap();
+    let card = store.card(cid).unwrap();
+
+    // 先正常建一个工作区
+    let first = workspace::ensure_workspace(&store, &group, &card).unwrap();
+
+    // 把数据库里的路径改成旧版本那种带 `..` 的形式
+    let dirty = format!(
+        "{}/../{}.worktrees/{}",
+        repo.to_string_lossy(),
+        repo.file_name().unwrap().to_string_lossy(),
+        first.workspace.path.rsplit('/').next().unwrap()
+    );
+    assert!(dirty.contains(".."));
+    let mut ws = first.workspace.clone();
+    ws.path = dirty.clone();
+    store.save_workspace(&ws).unwrap();
+
+    // 复用时应自动修正成干净路径
+    let again = workspace::ensure_workspace(&store, &group, &card).unwrap();
+    assert!(!again.created);
+    assert!(!again.workspace.path.contains(".."), "{}", again.workspace.path);
+    assert_eq!(again.workspace.path, first.workspace.path);
+    // 数据库里也修好了
+    assert_eq!(
+        store.workspace_for_card(cid).unwrap().unwrap().path,
+        first.workspace.path
+    );
+
+    let _ = git::worktree_remove(&first.workspace.repo_path, &first.workspace.path, true);
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(Path::new(&first.workspace.path).parent().unwrap());
+}
