@@ -262,6 +262,15 @@ fn workspace_button_injects_cmux_group_when_open_cmd_is_cmux() {
         assert_eq!(cmd, "cmux {worktree}");
     }
 
+    // cmux 的开目录快捷命令必须改成正式 API，--group 才会被消费。
+    assert_eq!(
+        workspace::format_cmux_group_command(
+            "/tmp/repo.worktrees/1-x",
+            "workspace_group:7"
+        ),
+        "cmux new-workspace --cwd /tmp/repo.worktrees/1-x --group workspace_group:7 --group-placement end"
+    );
+
     // 非 cmux 命令一律不动
     let (cmd, group) = workspace::group_aware_open("code {worktree}", &repo.to_string_lossy());
     assert_eq!(cmd, "code {worktree}");
