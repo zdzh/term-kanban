@@ -123,6 +123,10 @@ pub fn ensure_workspace(store: &Store, group: &Group, card: &Card) -> Result<Ens
 /// 匹配顺序：`idempotency_key`（`repo:<真实路径>`，最可靠）→ 分组名 == 仓库目录名。
 /// 都没有就建一个。建组时带 `--idempotency-key`，并发/重试不会建出两个。
 pub fn ensure_cmux_group(repo_path: &str) -> Option<String> {
+    // 单测/离线环境显式关闭外部 cmux 调用，避免测试污染用户的 cmux 状态。
+    if std::env::var_os("KANBAN_DISABLE_CMUX").is_some() {
+        return None;
+    }
     let repo = std::path::Path::new(repo_path);
     let name = repo.file_name()?.to_string_lossy().to_string();
     let real = std::fs::canonicalize(repo)
@@ -234,9 +238,15 @@ pub fn group_aware_open(open_cmd: &str, repo_path: &str) -> (String, Option<Stri
     };
 
     // `cmux <path>` 的快捷形式不消费 --group；必须改用正式 API。
-    let patched = format!("cmux new-workspace --cwd {path} --group {group} --group-placement end");
+    let patched = format_cmux_group_command(path, &group);
     (patched, Some(group))
 }
+
+/// 把 cmux 的开目录快捷命令转成真正支持 `--group` 的 workspace create 命令。
+pub fn format_cmux_group_command(path: &str, group: &str) -> String {
+    format!("cmux new-workspace --cwd {path} --group {group} --group-placement end")
+}
+
 /// cmux 建组会生成一个空锚点 workspace（落在调用者当前目录、名字就是组名）。
 /// 第一个真实成员进来后把锚点换掉，并关掉那个空条目。
 pub fn adopt_cmux_anchor(group: &str, worktree: &str) {

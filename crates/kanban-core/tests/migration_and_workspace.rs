@@ -238,7 +238,8 @@ fn relations_reject_cycles_and_duplicates() {
 
 #[test]
 fn workspace_button_injects_cmux_group_when_open_cmd_is_cmux() {
-    // 只验证"命令改写"这一步，不真的调 cmux（CI 里没有 cmux）
+    // 只验证"命令改写"这一步；本机可能装了 cmux，测试不得改用户状态。
+    std::env::set_var("KANBAN_DISABLE_CMUX", "1");
     let repo = temp_repo("grp");
     let store = Store::open_in_memory().unwrap();
     let gid = store.groups(false, false).unwrap()[0].id;
