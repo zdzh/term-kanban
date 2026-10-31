@@ -219,29 +219,24 @@ pub fn group_aware_open(open_cmd: &str, repo_path: &str) -> (String, Option<Stri
     let trimmed = open_cmd.trim();
     let mut parts = trimmed.split_whitespace();
     let bin = parts.next().unwrap_or("");
-    if bin.rsplit('/').next() != Some("cmux") {
+    if bin.rsplit('/').next() != Some("cmux") || trimmed.contains("--group") {
         return (open_cmd.to_string(), None);
     }
-    if trimmed.contains("--group") {
-        return (open_cmd.to_string(), None);
-    }
+
     let rest: Vec<&str> = parts.collect();
-    let plain_path = match rest.as_slice() {
-        [] => true,
-        [only] => !only.starts_with('-'),
-        ["open", only] => !only.starts_with('-'),
-        _ => false,
+    let path = match rest.as_slice() {
+        [only] if !only.starts_with('-') => *only,
+        ["open", only] if !only.starts_with('-') => *only,
+        _ => return (open_cmd.to_string(), None),
     };
-    if !plain_path {
+    let Some(group) = ensure_cmux_group(repo_path) else {
         return (open_cmd.to_string(), None);
-    }
+    };
 
-    match ensure_cmux_group(repo_path) {
-        Some(group) => (format!("{trimmed} --group {group}"), Some(group)),
-        None => (open_cmd.to_string(), None),
-    }
+    // `cmux <path>` 的快捷形式不消费 --group；必须改用正式 API。
+    let patched = format!("cmux new-workspace --cwd {path} --group {group} --group-placement end");
+    (patched, Some(group))
 }
-
 /// cmux 建组会生成一个空锚点 workspace（落在调用者当前目录、名字就是组名）。
 /// 第一个真实成员进来后把锚点换掉，并关掉那个空条目。
 pub fn adopt_cmux_anchor(group: &str, worktree: &str) {
@@ -321,9 +316,19 @@ pub fn run_group_button(
             let cmd = template::render_command(&button.open_template, &vars)
                 .map_err(|e| StoreError::InvalidConfig(format!("按钮「{}」：{e}", button.label)))?;
             let (cmd, group) = group_aware_open(&cmd, &vars.repo);
-            let outcome = exec::run_shell(store, "button", None, &cmd, button.needs_terminal, echo)?;
+            let outcome =
+                exec::run_shell(store, "button", None, &cmd, button.needs_terminal, echo)?;
             // cmux 建组时会留一个空锚点，把它换成刚开的真实 workspace
-            if let (Some(group), true) = (group, matches!(outcome, Outcome::Finished { exit_code: Some(0), .. })) {
+            if let (Some(group), true) = (
+                group,
+                matches!(
+                    outcome,
+                    Outcome::Finished {
+                        exit_code: Some(0),
+                        ..
+                    }
+                ),
+            ) {
                 adopt_cmux_anchor(&group, &ensured.workspace.path);
             }
             Ok(outcome)

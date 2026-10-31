@@ -250,6 +250,11 @@ fn workspace_button_injects_cmux_group_when_open_cmd_is_cmux() {
     let (cmd, group) = workspace::group_aware_open("cmux {worktree}", &repo.to_string_lossy());
     // 本机有 cmux 时会补 --group；没有时原样返回。两种都算对。
     if let Some(g) = group {
+        assert!(
+            cmd.contains("new-workspace"),
+            "必须使用 cmux 正式 API: {cmd}"
+        );
+        assert!(cmd.contains("--cwd"), "{cmd}");
         assert!(cmd.contains("--group"), "{cmd}");
         assert!(cmd.contains(&g), "{cmd}");
     } else {
@@ -262,7 +267,10 @@ fn workspace_button_injects_cmux_group_when_open_cmd_is_cmux() {
     assert!(group.is_none());
 
     // 已经带 --group 的不重复加
-    let (cmd, _) = workspace::group_aware_open("cmux {worktree} --group workspace_group:1", &repo.to_string_lossy());
+    let (cmd, _) = workspace::group_aware_open(
+        "cmux {worktree} --group workspace_group:1",
+        &repo.to_string_lossy(),
+    );
     assert_eq!(cmd.matches("--group").count(), 1);
 
     let _ = std::fs::remove_dir_all(&repo);
@@ -280,7 +288,11 @@ fn worktree_path_has_no_dotdot_segments() {
     let card = store.card(cid).unwrap();
 
     let v = kanban_core::Vars::build(&group, &card);
-    assert!(!v.worktree.contains(".."), "worktree 路径不该含 ..: {}", v.worktree);
+    assert!(
+        !v.worktree.contains(".."),
+        "worktree 路径不该含 ..: {}",
+        v.worktree
+    );
     assert_eq!(v.worktree, "/Users/me/app.worktrees/1-bug");
 }
 
@@ -314,7 +326,11 @@ fn stale_workspace_path_is_cleaned_on_reuse() {
     // 复用时应自动修正成干净路径
     let again = workspace::ensure_workspace(&store, &group, &card).unwrap();
     assert!(!again.created);
-    assert!(!again.workspace.path.contains(".."), "{}", again.workspace.path);
+    assert!(
+        !again.workspace.path.contains(".."),
+        "{}",
+        again.workspace.path
+    );
     assert_eq!(again.workspace.path, first.workspace.path);
     // 数据库里也修好了
     assert_eq!(
